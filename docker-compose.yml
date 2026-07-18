@@ -1,0 +1,53 @@
+version: '3.9'
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: agent-suite-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - agent-suite-net
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    command: serve
+
+  backend:
+    image: python:3.12-slim
+    container_name: agent-suite-backend
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: sh -c "pip install -r backend/requirements.txt && python backend/server.py"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - LOCKDOWN_MODE=false
+      - DISABLE_TELEMETRY=true
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000,http://127.0.0.1:8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - ollama
+    networks:
+      - agent-suite-net
+
+  frontend:
+    image: python:3.12-slim
+    container_name: agent-suite-frontend
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: sh -c "python -m http.server 8080 --directory frontend"
+    ports:
+      - "8080:8080"
+    networks:
+      - agent-suite-net
+
+volumes:
+  ollama-data:
+
+networks:
+  agent-suite-net:
+    driver: bridge
+    internal: true
