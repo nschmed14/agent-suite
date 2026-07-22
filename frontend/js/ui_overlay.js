@@ -1,6 +1,6 @@
 function getBackendBaseUrl() {
   const override = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
-  const port = override ? String(override) : '8000';
+  const port = override ? String(override) : '8011';
   return `${window.location.protocol}//${window.location.hostname || 'localhost'}:${port}`;
 }
 
@@ -13,6 +13,7 @@ class UIOverlay {
         text: 'Hello. I can help you coordinate the office, assign tasks, and keep the manager informed.',
       },
     ];
+    this.lastAssistantMessageText = null;
 
     this.container = document.createElement('div');
     this.container.style.position = 'fixed';
@@ -25,6 +26,7 @@ class UIOverlay {
     this.container.style.pointerEvents = 'auto';
     this.container.style.zIndex = '30';
     this.container.style.overflow = 'hidden';
+    this.container.style.background = 'transparent';
     document.body.appendChild(this.container);
 
     this.launcher = document.createElement('button');
@@ -54,22 +56,31 @@ class UIOverlay {
     this.panel.style.display = 'none';
     this.panel.style.pointerEvents = 'auto';
     this.panel.style.padding = '24px';
-    this.panel.style.background = 'rgba(247, 242, 232, 0.98)';
-    this.panel.style.backdropFilter = 'blur(10px)';
+    this.panel.style.background = 'rgba(255, 255, 255, 0)';
+    this.panel.style.backdropFilter = 'none';
     this.panel.style.overflow = 'hidden';
+    this.panel.style.alignItems = 'stretch';
+    this.panel.style.justifyContent = 'flex-start';
     this.container.appendChild(this.panel);
 
     const shell = document.createElement('div');
     shell.style.display = 'flex';
     shell.style.gap = '16px';
     shell.style.height = '100%';
+    shell.style.width = '100%';
+    shell.style.maxWidth = '960px';
+    shell.style.margin = '0 0 0 0';
+    shell.style.alignItems = 'stretch';
+    shell.style.justifyContent = 'flex-start';
     this.panel.appendChild(shell);
 
     this.historyPanel = document.createElement('div');
-    this.historyPanel.style.flex = '1';
-    this.historyPanel.style.background = '#ffffff';
+    this.historyPanel.style.flex = '1 1 60%';
+    this.historyPanel.style.maxWidth = '640px';
+    this.historyPanel.style.background = 'rgba(255, 255, 255, 0.72)';
     this.historyPanel.style.borderRadius = '24px';
     this.historyPanel.style.padding = '18px 18px 16px';
+    this.historyPanel.style.border = '1px solid rgba(255, 255, 255, 0.45)';
     this.historyPanel.style.display = 'flex';
     this.historyPanel.style.flexDirection = 'column';
     this.historyPanel.style.minWidth = '0';
@@ -125,15 +136,15 @@ class UIOverlay {
     inputRow.appendChild(this.sendButton);
 
     this.managerPane = document.createElement('div');
-    this.managerPane.style.flex = '0 0 38%';
-    this.managerPane.style.background = 'linear-gradient(135deg, rgba(31,38,48,0.96), rgba(66,79,102,0.95))';
+    this.managerPane.style.flex = '0 0 0';
+    this.managerPane.style.background = 'transparent';
     this.managerPane.style.borderRadius = '24px';
-    this.managerPane.style.padding = '16px';
-    this.managerPane.style.display = 'flex';
+    this.managerPane.style.padding = '0';
+    this.managerPane.style.display = 'none';
     this.managerPane.style.flexDirection = 'column';
     this.managerPane.style.justifyContent = 'space-between';
-    this.managerPane.style.color = '#f7f2e8';
-    this.managerPane.style.boxShadow = '0 18px 45px rgba(0,0,0,0.16)';
+    this.managerPane.style.color = '#1f2630';
+    this.managerPane.style.boxShadow = 'none';
     shell.appendChild(this.managerPane);
 
     const managerHeader = document.createElement('div');
@@ -147,17 +158,17 @@ class UIOverlay {
     this.managerAvatar.style.alignItems = 'center';
     this.managerAvatar.style.justifyContent = 'center';
     this.managerAvatar.style.borderRadius = '16px';
-    this.managerAvatar.style.background = 'linear-gradient(135deg, rgba(245,200,130,0.2), rgba(255,255,255,0.08))';
+    this.managerAvatar.style.background = 'rgba(255,255,255,0.35)';
     this.managerAvatar.style.fontSize = '20px';
     this.managerAvatar.style.fontWeight = '700';
-    this.managerAvatar.style.color = '#f7f2e8';
+    this.managerAvatar.style.color = '#1f2630';
     this.managerAvatar.textContent = 'M';
     this.managerPane.appendChild(this.managerAvatar);
 
     this.statusEl = document.createElement('div');
     this.statusEl.style.marginTop = '12px';
     this.statusEl.style.fontSize = '13px';
-    this.statusEl.style.color = '#d9c8a7';
+    this.statusEl.style.color = '#4b5563';
     this.managerPane.appendChild(this.statusEl);
 
     const closeButton = document.createElement('button');
@@ -194,6 +205,8 @@ class UIOverlay {
     this.panel.style.visibility = 'visible';
     this.panel.style.opacity = '1';
     this.launcher.style.display = 'none';
+    this.historyPanel.style.flex = '1 1 60%';
+    this.managerPane.style.display = 'none';
     this.launcher.style.visibility = 'hidden';
     this.launcher.style.opacity = '0';
     this.inputEl.focus();
@@ -206,6 +219,8 @@ class UIOverlay {
     this.launcher.style.display = 'inline-block';
     this.launcher.style.visibility = 'visible';
     this.launcher.style.opacity = '1';
+    this.historyPanel.style.flex = '1';
+    this.managerPane.style.display = 'none';
     this.inputEl.value = '';
   }
 
@@ -234,7 +249,18 @@ class UIOverlay {
     if (!message) {
       return;
     }
-    this.appendMessage('assistant', message);
+
+    const normalizedMessage = String(message).trim();
+    if (!normalizedMessage) {
+      return;
+    }
+
+    if (this.lastAssistantMessageText === normalizedMessage) {
+      return;
+    }
+
+    this.lastAssistantMessageText = normalizedMessage;
+    this.appendMessage('assistant', normalizedMessage);
     if (modelStatus === 'fallback') {
       this.setStatus('Using a lightweight local fallback');
     } else {
@@ -261,6 +287,7 @@ class UIOverlay {
 
     this.appendMessage('user', requestText);
     this.inputEl.value = '';
+    this.lastAssistantMessageText = null;
     this.setStatus('Thinking locally…');
 
     const backendUrl = `${getBackendBaseUrl()}/assistant`;

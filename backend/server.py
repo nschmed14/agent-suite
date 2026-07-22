@@ -33,9 +33,11 @@ from backend.office_state import OfficeState
 settings = get_settings()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize the backend services when the server starts."""
+def initialize_app_state() -> None:
+    """Ensure the backend services exist even when the app is exercised outside a full startup."""
+    if hasattr(app.state, "assistant"):
+        return
+
     os.makedirs(settings.data_dir, exist_ok=True)
     app.state.office_state = OfficeState()
     app.state.memory = LocalMemory(settings.sqlite_path, settings.chroma_path)
@@ -43,6 +45,12 @@ async def lifespan(app: FastAPI):
     app.state.assistant = Assistant(app.state.memory, settings)
     app.state.connections: List[WebSocket] = []
     app.state.assistant.register_callback(lambda payload: manager.broadcast(payload))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize the backend services when the server starts."""
+    initialize_app_state()
     await app.state.crew_runner.start()
     yield
     await app.state.crew_runner.stop()
@@ -155,8 +163,15 @@ async def submit_assistant_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not request_text:
         raise HTTPException(status_code=400, detail="Request is required")
 
-    asyncio.create_task(app.state.assistant.run(request_text))
-    return {"status": "accepted", "request": request_text}
+    initialize_app_state()
+    result = await app.state.assistant.run(request_text)
+    return {
+        "status": "accepted",
+        "request": request_text,
+        "response": result.get("response", ""),
+        "plan": result.get("plan", []),
+        "model_status": result.get("model_status", "fallback"),
+    }
 
 
 @app.websocket("/office")
@@ -202,6 +217,8 @@ async def office_socket(websocket: WebSocket) -> None:
 @app.on_event("startup")
 async def register_runner_callback() -> None:
     """Connect the runner to the broadcast function."""
+    initialize_app_state()
+
     async def push_state(payload: Dict[str, Any]) -> None:
         await manager.broadcast(payload)
 

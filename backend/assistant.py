@@ -147,6 +147,19 @@ class Assistant:
 
         try:
             client = ollama.Client(host=self.settings.ollama_base_url)
+            available_models = client.list().get("models", []) if hasattr(client, "list") else []
+            model_names = []
+            for model in available_models:
+                if isinstance(model, dict):
+                    model_names.append(str(model.get("name", "")))
+                else:
+                    model_names.append(str(model))
+            if self.settings.ollama_model not in model_names:
+                try:
+                    client.pull(self.settings.ollama_model)
+                except Exception:
+                    pass
+
             prompt = self._build_prompt(request, context)
             response = client.chat(
                 model=self.settings.ollama_model,
@@ -161,10 +174,16 @@ class Assistant:
             return self._fallback_response(request, context), "fallback"
 
     def _greeting_response(self) -> str:
-        return "I’m handling your request locally with a calendar, manager, email workflow. Ollama is not available yet, so I’m using a lightweight local fallback response."
+        return (
+            "I’m handling your request locally with a calendar, manager, and email workflow. "
+            f"I’m configured to use Ollama model {self.settings.ollama_model} when it is available."
+        )
 
     def _fallback_response(self, request: str, context: List[Dict[str, Any]]) -> str:
-        return "Unable to reach the manager agent; this is a fallback response"
+        return (
+            f"I’m unable to reach the Ollama model {self.settings.ollama_model}, so I’m using a local "
+            "fallback response from this session."
+        )
 
     def _build_prompt(self, request: str, context: List[Dict[str, Any]]) -> str:
         formatted_context = json.dumps(context, indent=2)
