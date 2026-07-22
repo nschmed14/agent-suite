@@ -44,7 +44,7 @@ class Settings:
         if item.strip()
     )
     ws_host: str = os.getenv("WS_HOST", "127.0.0.1")
-    ws_port: int = int(os.getenv("WS_PORT", "8010"))
+    ws_port: int = int(os.getenv("WS_PORT", "8000"))
 
 
 def get_settings() -> Settings:

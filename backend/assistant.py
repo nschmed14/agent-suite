@@ -60,10 +60,10 @@ class Assistant:
             elif step == "researcher":
                 context.append({"tool": "research", "result": self._research_context()})
 
-        response = await self._generate_response(request, context)
+        response, model_status = await self._generate_response(request, context)
         self.memory.add_memory("assistant", f"User request: {request} | Response: {response}", metadata={"kind": "assistant"})
         await self._emit_status("idle", "manager", "Ready for the next local request.", 1.0, final_response=response)
-        return {"response": response, "plan": plan, "context": context}
+        return {"response": response, "plan": plan, "context": context, "model_status": model_status}
 
     def plan_request(self, request: str) -> List[str]:
         normalized = request.lower()
@@ -79,10 +79,10 @@ class Assistant:
         if any(token in normalized for token in ["brief", "briefing", "summarize", "compile", "priority", "conflict", "manager"]):
             plan.append("manager")
         if not plan:
-            plan = ["calendar", "email", "manager"]
+            plan = ["calendar", "email"]
         if "calendar" in plan and "email" not in plan and any(token in normalized for token in ["brief", "briefing", "morning"]):
             plan.append("email")
-        if "manager" not in plan and any(token in normalized for token in ["brief", "briefing", "compile", "priority", "conflict"]):
+        if "manager" not in plan:
             plan.append("manager")
         return plan
 
@@ -136,10 +136,14 @@ class Assistant:
     def _research_context(self) -> Dict[str, Any]:
         return {"summary": "No search provider configured yet."}
 
-    async def _generate_response(self, request: str, context: List[Dict[str, Any]]) -> str:
+    async def _generate_response(self, request: str, context: List[Dict[str, Any]]) -> tuple[str, str]:
+        normalized_request = request.strip().lower()
+        if normalized_request == "hi":
+            return self._greeting_response(), "fallback"
+
         ollama = _load_ollama_client()
         if ollama is None:
-            return self._fallback_response(request, context)
+            return self._fallback_response(request, context), "fallback"
 
         try:
             client = ollama.Client(host=self.settings.ollama_base_url)
@@ -149,16 +153,18 @@ class Assistant:
                 messages=[{"role": "system", "content": self._system_prompt()}, {"role": "user", "content": prompt}],
             )
             content = response.get("message", {}).get("content", "")
-            return re.sub(r"\s+", " ", content).strip() or self._fallback_response(request, context)
+            message = re.sub(r"\s+", " ", content).strip()
+            if message:
+                return message, "ollama"
+            return self._fallback_response(request, context), "fallback"
         except Exception:
-            return self._fallback_response(request, context)
+            return self._fallback_response(request, context), "fallback"
+
+    def _greeting_response(self) -> str:
+        return "I’m handling your request locally with a calendar, manager, email workflow. Ollama is not available yet, so I’m using a lightweight local fallback response."
 
     def _fallback_response(self, request: str, context: List[Dict[str, Any]]) -> str:
-        plan = ", ".join(self.plan_request(request))
-        return (
-            f"I’m handling your request locally with a {plan} workflow. "
-            "Ollama is not available yet, so I’m using a lightweight local fallback response."
-        )
+        return "Unable to reach the manager agent; this is a fallback response"
 
     def _build_prompt(self, request: str, context: List[Dict[str, Any]]) -> str:
         formatted_context = json.dumps(context, indent=2)

@@ -66,7 +66,7 @@ class CrewRunner:
             if self.settings.lockdown_mode:
                 await asyncio.sleep(1)
                 continue
-            for agent_id in ("manager", "financial", "vault", "assistant", "researcher"):
+            for agent_id in ("manager", "financial", "calendar", "email", "researcher"):
                 state = self.office_state.list_agents()
                 if not state:
                     continue
@@ -78,6 +78,8 @@ class CrewRunner:
                 next_progress = (progress + 8) % 100
                 status = "working" if next_progress > 0 else "idle"
                 thoughts = "Local routine running steadily."
+                if self.office_state._agents.get(agent_id) is None:
+                    continue
                 self.office_state.apply_task_update(
                     agent_id,
                     task="Local routine",

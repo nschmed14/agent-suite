@@ -1,12 +1,18 @@
+function getBackendWsUrl() {
+  const override = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
+  const port = override ? String(override) : '8000';
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${protocol}://${window.location.hostname || 'localhost'}:${port}/office`;
+}
+
 class OfficeViewer {
   constructor(rootElement) {
     this.rootElement = rootElement;
     this.agentElements = new Map();
     this.state = { agents: [] };
     this.renderShell();
-    const backendPort = window.location.port === '8080' ? '8010' : '8000';
     this.wsClient = new WebSocketClient(
-      `ws://${window.location.hostname || 'localhost'}:${backendPort}/office`,
+      getBackendWsUrl(),
       (payload) => this.handleSocketMessage(payload)
     );
     this.wsClient.connect();
@@ -220,6 +226,9 @@ class OfficeViewer {
     }
     if (payload.type === 'status_update') {
       this.uiOverlay.setStatus(payload.message || 'Assistant is working locally');
+      if (payload.final_response) {
+        this.uiOverlay.setResponse(payload.final_response);
+      }
       const agentStates = payload.agent_states || {};
       const nextAgents = (this.state.agents || []).map((agent) => {
         const state = agentStates[agent.id];
@@ -348,17 +357,19 @@ class OfficeViewer {
       alert: '#ff7f50',
     };
     const accent = colorMap[agent.status] || roleColors[agent.id] || '#7ec8e3';
+    const isBusy = agent.status === 'working' || agent.task_progress > 0;
     const body = element.children[1];
     const head = element.children[2];
     const leg = element.children[4];
 
     body.style.background = accent;
-    head.style.background = agent.status === 'working' ? '#f0e6d3' : '#f0e6d3';
-    leg.style.transform = agent.status === 'working' ? 'translateY(-3px)' : 'translateY(0)';
-    element.style.transform = `translate(-50%, -50%) ${agent.status === 'working' ? 'scale(1.03)' : 'scale(1)'}`;
+    head.style.background = isBusy ? '#fff6dc' : '#f0e6d3';
+    leg.style.transform = isBusy ? 'translateY(-3px)' : 'translateY(0)';
+    element.style.transform = `translate(-50%, -50%) ${isBusy ? 'scale(1.03)' : 'scale(1)'}`;
 
     const label = element.children[5];
     label.textContent = `${agent.name}\n${agent.status}`;
+    label.style.fontWeight = isBusy ? '700' : '400';
   }
 
   syncAgents() {

@@ -40,6 +40,9 @@ class LocalMemory:
                 self._collection = None
 
     def _ensure_schema(self) -> None:
+        self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.sqlite_path.exists():
+            self.sqlite_path.touch()
         connection = sqlite3.connect(self.sqlite_path)
         try:
             connection.execute(
