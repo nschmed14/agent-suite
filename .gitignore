@@ -1,3 +1,4 @@
+# Python cache and virtual environments
 __pycache__/
 *.py[cod]
 *.pyo
@@ -5,16 +6,43 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# Environment and secrets
 .env
-.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.token
+*.tokens
+*.secrets
+*.secret
+*.auth
+*.jsonl
+
+# Local data and databases
+*.sqlite3
+*.db
+*.db-journal
+/data/
+data/chroma/
+
+# Local runtime and build artifacts
 node_modules/
 dist/
 build/
 *.log
-*.sqlite3
-*.db
-/data/
 *.bin
 *.pt
 *.safetensors
 *.onnx
+*.DS_Store
+
+# Editor and OS noise
+.vscode/
+.idea/
