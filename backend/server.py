@@ -10,14 +10,21 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from contextlib import asynccontextmanager
 from ipaddress import ip_address, ip_network
+from pathlib import Path
 from typing import Any, Dict, List
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from backend.assistant import Assistant
 from backend.config import get_settings
 from backend.crew_runner import CrewRunner
 from backend.memory import LocalMemory
@@ -33,7 +40,9 @@ async def lifespan(app: FastAPI):
     app.state.office_state = OfficeState()
     app.state.memory = LocalMemory(settings.sqlite_path, settings.chroma_path)
     app.state.crew_runner = CrewRunner(app.state.office_state, app.state.memory, settings)
+    app.state.assistant = Assistant(app.state.memory, settings)
     app.state.connections: List[WebSocket] = []
+    app.state.assistant.register_callback(lambda payload: manager.broadcast(payload))
     await app.state.crew_runner.start()
     yield
     await app.state.crew_runner.stop()
@@ -134,6 +143,20 @@ async def submit_task(agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     runner = app.state.crew_runner
     asyncio.create_task(runner.run_task(agent_id, task_text))
     return {"status": "accepted", "agent_id": agent_id, "task": task_text}
+
+
+@app.post("/assistant")
+async def submit_assistant_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the single-brain assistant for a user request and stream status updates."""
+    if settings.lockdown_mode:
+        raise HTTPException(status_code=423, detail="Lockdown mode active")
+
+    request_text = str(payload.get("request", "")).strip()
+    if not request_text:
+        raise HTTPException(status_code=400, detail="Request is required")
+
+    asyncio.create_task(app.state.assistant.run(request_text))
+    return {"status": "accepted", "request": request_text}
 
 
 @app.websocket("/office")

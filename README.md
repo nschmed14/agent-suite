@@ -10,15 +10,16 @@ Privacy-first, fully local AI agent suite for an office simulation.
 
 ```text
 +------------------+      +----------------------+      +----------------------+
-| Phaser Frontend  | <--> | FastAPI WebSocket    | <--> | CrewAI / Ollama      |
-| (localhost)      |      | (localhost:8000)    |      | (localhost:11434)    |
+| Phaser Frontend  | <--> | FastAPI WebSocket    | <--> | Single local brain   |
+| (localhost)      |      | (localhost:8000)    |      | (Ollama / local)     |
 +------------------+      +----------------------+      +----------------------+
          |                           |                                |
          |                           |                                |
          v                           v                                v
 +------------------+      +----------------------+      +----------------------+
-| Local UI / Room |      | SQLite + ChromaDB   |      | Local-only tools     |
-| assets, audio   |      | private memory      |      | file/sql/calc/...    |
+| Office scene    |      | SQLite + ChromaDB   |      | Calendar / Email /   |
+| and character   |      | private memory      |      | Finance / Search     |
+| status UI       |      |                     |      | tools                |
 +------------------+      +----------------------+      +----------------------+
 ```
 
@@ -39,6 +40,7 @@ No external network calls are made by the backend or agents. Tailscale is option
 2. Copy .env.example to .env and review the defaults.
 3. Run docker compose up.
 4. Open http://localhost:8080 in your browser.
+5. Try a local request such as “Morning briefing” or “Draft an email reply”.
 
 ## Local Development
 

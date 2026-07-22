@@ -4,8 +4,9 @@ class OfficeViewer {
     this.agentElements = new Map();
     this.state = { agents: [] };
     this.renderShell();
+    const backendPort = window.location.port === '8080' ? '8010' : '8000';
     this.wsClient = new WebSocketClient(
-      `ws://${window.location.hostname || 'localhost'}:8000/office`,
+      `ws://${window.location.hostname || 'localhost'}:${backendPort}/office`,
       (payload) => this.handleSocketMessage(payload)
     );
     this.wsClient.connect();
@@ -97,6 +98,13 @@ class OfficeViewer {
       { left: '580px', top: '190px' },
       { left: '760px', top: '190px' },
     ];
+    const agentRoles = {
+      manager: { name: 'Manager', color: '#7ec8e3' },
+      financial: { name: 'Finance', color: '#8fbc8f' },
+      calendar: { name: 'Calendar', color: '#e8a85d' },
+      email: { name: 'Email', color: '#f0e6d3' },
+      researcher: { name: 'Research', color: '#c4a882' },
+    };
 
     desks.forEach((desk, index) => {
       const deskEl = document.createElement('div');
@@ -118,7 +126,7 @@ class OfficeViewer {
       deskLabel.style.top = '8px';
       deskLabel.style.color = '#f0e6d3';
       deskLabel.style.fontSize = '12px';
-      deskLabel.textContent = `Desk ${index + 1}`;
+      deskLabel.textContent = agentRoles[Object.keys(agentRoles)[index]]?.name || `Desk ${index + 1}`;
       deskEl.appendChild(deskLabel);
     });
 
@@ -190,9 +198,45 @@ class OfficeViewer {
 
   handleSocketMessage(payload) {
     if (payload.type === 'state_update') {
-      this.state = payload.state;
+      const previousAgents = this.state.agents || [];
+      const nextAgents = (payload.state.agents || []).map((incomingAgent) => {
+        const previousAgent = previousAgents.find((agent) => agent.id === incomingAgent.id);
+        const hasAssistantThought = previousAgent && typeof previousAgent.thoughts === 'string' && !previousAgent.thoughts.includes('Local routine');
+        if (!hasAssistantThought) {
+          return incomingAgent;
+        }
+        return {
+          ...incomingAgent,
+          ...previousAgent,
+          status: previousAgent.status || incomingAgent.status,
+          thoughts: previousAgent.thoughts || incomingAgent.thoughts,
+          task: previousAgent.task || incomingAgent.task,
+          task_progress: previousAgent.task_progress ?? incomingAgent.task_progress,
+        };
+      });
+      this.state = { agents: nextAgents };
       this.syncAgents();
-      this.uiOverlay.setAgentsState(this.state.agents || []);
+      this.uiOverlay.setAgentsState(nextAgents);
+    }
+    if (payload.type === 'status_update') {
+      this.uiOverlay.setStatus(payload.message || 'Assistant is working locally');
+      const agentStates = payload.agent_states || {};
+      const nextAgents = (this.state.agents || []).map((agent) => {
+        const state = agentStates[agent.id];
+        if (!state) {
+          return agent;
+        }
+        return {
+          ...agent,
+          status: state.status || agent.status,
+          thoughts: state.thoughts || agent.thoughts,
+          task: payload.current_task || agent.task,
+          task_progress: Math.round((payload.progress || 0) * 100) || agent.task_progress,
+        };
+      });
+      this.state = { agents: nextAgents };
+      this.syncAgents();
+      this.uiOverlay.setAgentsState(nextAgents);
     }
     if (payload.type === 'connection' && payload.connected === false) {
       this.uiOverlay.setStatus('Reconnecting to local backend…');
@@ -290,13 +334,20 @@ class OfficeViewer {
     element.style.left = `${x}px`;
     element.style.top = `${y}px`;
 
+    const roleColors = {
+      manager: '#7ec8e3',
+      financial: '#8fbc8f',
+      calendar: '#e8a85d',
+      email: '#f0e6d3',
+      researcher: '#c4a882',
+    };
     const colorMap = {
-      idle: '#7ec8e3',
+      idle: roleColors[agent.id] || '#7ec8e3',
       working: '#f5c882',
       sleeping: '#4d3b2e',
       alert: '#ff7f50',
     };
-    const accent = colorMap[agent.status] || '#7ec8e3';
+    const accent = colorMap[agent.status] || roleColors[agent.id] || '#7ec8e3';
     const body = element.children[1];
     const head = element.children[2];
     const leg = element.children[4];

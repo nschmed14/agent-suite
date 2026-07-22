@@ -30,10 +30,10 @@ class UIOverlay {
     this.agentSelect = document.createElement('select');
     this.agentSelect.innerHTML = `
       <option value="manager">Manager</option>
-      <option value="financial">Financial</option>
-      <option value="vault">Work Vault</option>
-      <option value="assistant">Personal Assistant</option>
-      <option value="researcher">Researcher</option>
+      <option value="financial">Finance</option>
+      <option value="calendar">Calendar</option>
+      <option value="email">Email</option>
+      <option value="researcher">Research</option>
     `;
     this.agentSelect.style.marginTop = '10px';
     this.agentSelect.style.width = '100%';
@@ -55,6 +55,13 @@ class UIOverlay {
     this.button.onclick = () => this.submitTask();
     this.container.appendChild(this.button);
 
+    this.assistantHint = document.createElement('div');
+    this.assistantHint.style.marginTop = '10px';
+    this.assistantHint.style.fontSize = '12px';
+    this.assistantHint.style.color = '#d9c8a7';
+    this.assistantHint.innerHTML = 'Try: “Morning briefing” or “Draft an email reply”';
+    this.container.appendChild(this.assistantHint);
+
     this.setStatus('Waiting for office state…');
     this.agentListEl.innerHTML = '<div style="margin-top:8px"><strong>Office Panel</strong><br/>Agent state will appear here.</div>';
   }
@@ -72,7 +79,8 @@ class UIOverlay {
     const rows = agents.map((agent) => {
       const progress = agent.task_progress ?? 0;
       const thought = agent.thoughts ? agent.thoughts : 'Listening locally';
-      return `<div style="margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid rgba(245,200,130,0.2)"><strong>${agent.name}</strong><br/>Status: ${agent.status}<br/>Progress: ${progress}%<br/>Thought: ${thought}</div>`;
+      const task = agent.task ? `<br/>Task: ${agent.task}` : '';
+      return `<div style="margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid rgba(245,200,130,0.2)"><strong>${agent.name}</strong><br/>Status: ${agent.status}<br/>Progress: ${progress}%${task}<br/>Thought: ${thought}</div>`;
     });
 
     this.agentListEl.innerHTML = rows.join('');
@@ -84,17 +92,16 @@ class UIOverlay {
       return;
     }
 
-    const agentId = this.agentSelect.value;
-    const backendUrl = `${window.location.protocol}//${window.location.hostname}:8000/task/${agentId}`;
-
-    this.setStatus(`Sending task to ${agentId}…`);
+    const backendPort = window.location.port === '8080' ? '8010' : '8000';
+    const backendUrl = `${window.location.protocol}//${window.location.hostname}:${backendPort}/assistant`;
+    this.setStatus('Sending request to the local assistant…');
     fetch(backendUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ task }),
+      body: JSON.stringify({ request: task }),
     })
       .then(() => {
-        this.setStatus(`Task sent to ${agentId}`);
+        this.setStatus('Assistant received the request');
         this.taskInput.value = '';
       })
       .catch(() => {

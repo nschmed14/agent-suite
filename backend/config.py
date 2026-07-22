@@ -27,6 +27,7 @@ class Settings:
     """Application configuration used by the backend and agents."""
 
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
     tailscale_enabled: bool = _as_bool(os.getenv("TAILSCALE_ENABLED"), False)
     tailscale_network: str = os.getenv("TAILSCALE_NETWORK", "100.64.0.0/10")
     lockdown_mode: bool = _as_bool(os.getenv("LOCKDOWN_MODE"), False)
@@ -42,8 +43,8 @@ class Settings:
         ).split(",")
         if item.strip()
     )
-    ws_host: str = os.getenv("WS_HOST", "0.0.0.0")
-    ws_port: int = int(os.getenv("WS_PORT", "8000"))
+    ws_host: str = os.getenv("WS_HOST", "127.0.0.1")
+    ws_port: int = int(os.getenv("WS_PORT", "8010"))
 
 
 def get_settings() -> Settings:
