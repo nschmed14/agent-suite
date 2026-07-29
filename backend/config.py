@@ -27,7 +27,7 @@ class Settings:
     """Application configuration used by the backend and agents."""
 
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+    ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
     tailscale_enabled: bool = _as_bool(os.getenv("TAILSCALE_ENABLED"), False)
     tailscale_network: str = os.getenv("TAILSCALE_NETWORK", "100.64.0.0/10")
     lockdown_mode: bool = _as_bool(os.getenv("LOCKDOWN_MODE"), False)

@@ -154,15 +154,39 @@ class Assistant:
                     model_names.append(str(model.get("name", "")))
                 else:
                     model_names.append(str(model))
-            if self.settings.ollama_model not in model_names:
+
+            preferred_models = [
+                "phi3.5:3.5-mini-instruct-q4_K_M",
+                "llama3.2:3b",
+                self.settings.ollama_model,
+            ]
+            model_to_use = next((model for model in preferred_models if model in model_names), None)
+            if model_to_use is None:
+                quantized_candidates = [
+                    model
+                    for model in model_names
+                    if any(token in model.lower() for token in ("q4", "q5", "q8", "mini", "3b", "small", "tiny"))
+                ]
+                model_to_use = min(
+                    quantized_candidates,
+                    key=lambda name: (
+                        "3b" not in name.lower(),
+                        "mini" not in name.lower(),
+                        len(name),
+                        name.lower(),
+                    ),
+                ) if quantized_candidates else self.settings.ollama_model
+
+            if model_to_use not in model_names:
                 try:
-                    client.pull(self.settings.ollama_model)
+                    client.pull(model_to_use)
                 except Exception:
                     pass
 
+            # SWAPPED FOR LATENCY - CHAT TURNS ONLY. BACKGROUND TASKS USE 8B.
             prompt = self._build_prompt(request, context)
             response = client.chat(
-                model=self.settings.ollama_model,
+                model=model_to_use,
                 messages=[{"role": "system", "content": self._system_prompt()}, {"role": "user", "content": prompt}],
             )
             content = response.get("message", {}).get("content", "")
@@ -191,9 +215,17 @@ class Assistant:
 
     def _system_prompt(self) -> str:
         return (
-            "You are Agent Suite, a warm and concise local assistant. "
-            "You help with calendar, email, finance, and research tasks while keeping everything local. "
-            "Never invent information. If you are unsure, say so clearly. "
-            "When drafting an email, clearly label it as a draft and never imply it was sent. "
-            "Call out conflicts or unusual patterns when they are apparent."
+            "You are the Axiom Office Manager. You have no direct access to calendars, email, or the web.\n"
+            "Your only job is to triage user requests to one of four specialists:\n\n"
+            "- Scheduler (calendar events)\n"
+            "- Mail (draft emails only)\n"
+            "- Finance (Rocket Money data)\n"
+            "- Researcher (internet search)\n\n"
+            "Output must be strictly parseable:\n"
+            "ROUTE: [AgentName]\n"
+            "DATA: [Extracted task description]\n\n"
+            "If the request is a morning greeting or general check-in, respond with a \n"
+            "brief greeting and the morning briefing from the local cache. Do not \n"
+            "invent data.\n\n"
+            "Do not let the model free-associate. If it can't route, it should respond with: `ROUTE: UNKNOWN | DATA: Please clarify your request.`"
         )

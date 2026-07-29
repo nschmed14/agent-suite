@@ -1,7 +1,17 @@
+function getBackendHost() {
+  const overrideHost = window.AGENT_SUITE_BACKEND_HOST || window.__AGENT_SUITE_BACKEND_HOST__;
+  if (overrideHost) {
+    return overrideHost;
+  }
+
+  const hostname = window.location.hostname || 'localhost';
+  return hostname === 'localhost' || hostname === '::1' ? '127.0.0.1' : hostname;
+}
+
 function getBackendBaseUrl() {
   const override = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
   const port = override ? String(override) : '8011';
-  return `${window.location.protocol}//${window.location.hostname || 'localhost'}:${port}`;
+  return `${window.location.protocol}//${getBackendHost()}:${port}`;
 }
 
 class UIOverlay {

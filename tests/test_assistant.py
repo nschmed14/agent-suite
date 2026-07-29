@@ -68,6 +68,40 @@ class AssistantTests(unittest.TestCase):
         self.assertIn("response", payload)
         self.assertIn("model_status", payload)
 
+    def test_prefers_small_chat_model_when_available(self) -> None:
+        assistant = self._build_assistant()
+
+        class FakeClient:
+            instances = []
+
+            def __init__(self, *args, **kwargs) -> None:
+                self.pull_calls = []
+                self.chat_calls = []
+                FakeClient.instances.append(self)
+
+            def list(self) -> dict:
+                return {"models": [{"name": "phi3.5:3.5-mini-instruct-q4_K_M"}, {"name": "llama3.1:8b"}]}
+
+            def pull(self, model: str) -> dict:
+                self.pull_calls.append(model)
+                return {"status": "success"}
+
+            def chat(self, model: str, messages: list) -> dict:
+                self.chat_calls.append((model, messages))
+                return {"message": {"content": "Hello from the fast chat model"}}
+
+        class FakeOllamaModule:
+            @staticmethod
+            def Client(*args, **kwargs) -> FakeClient:
+                return FakeClient(*args, **kwargs)
+
+        with patch("backend.assistant._load_ollama_client", return_value=FakeOllamaModule):
+            payload = asyncio.run(assistant.run("hello there"))
+
+        self.assertEqual(payload["model_status"], "ollama")
+        self.assertIn("fast chat model", payload["response"].lower())
+        self.assertEqual(FakeClient.instances[0].chat_calls[0][0], "phi3.5:3.5-mini-instruct-q4_K_M")
+
     def test_assistant_pulls_missing_model_before_chat(self) -> None:
         assistant = self._build_assistant()
 

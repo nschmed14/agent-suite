@@ -1,8 +1,18 @@
+function getBackendHost() {
+  const overrideHost = window.AGENT_SUITE_BACKEND_HOST || window.__AGENT_SUITE_BACKEND_HOST__;
+  if (overrideHost) {
+    return overrideHost;
+  }
+
+  const hostname = window.location.hostname || 'localhost';
+  return hostname === 'localhost' || hostname === '::1' ? '127.0.0.1' : hostname;
+}
+
 function getBackendWsUrl() {
   const override = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
   const port = override ? String(override) : '8011';
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${protocol}://${window.location.hostname || 'localhost'}:${port}/office`;
+  return `${protocol}://${getBackendHost()}:${port}/office`;
 }
 
 class OfficeViewer {
