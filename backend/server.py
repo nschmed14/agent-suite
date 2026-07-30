@@ -19,6 +19,8 @@ from typing import Any, Dict, List
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from starlette.staticfiles import StaticFiles
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -58,6 +60,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Agent Suite", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.mount("/assets", StaticFiles(directory=ROOT_DIR / "frontend" / "assets"), name="assets")
+app.mount("/js", StaticFiles(directory=ROOT_DIR / "frontend" / "js"), name="js")
 
 
 def _is_allowed_origin(origin: str) -> bool:
@@ -127,6 +131,12 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+@app.get("/")
+async def index() -> FileResponse:
+    """Serve the frontend entry page for the local demo."""
+    return FileResponse(ROOT_DIR / "frontend" / "index.html")
+
+
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     """Return a concise health payload."""
@@ -154,6 +164,7 @@ async def submit_task(agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.post("/assistant")
+@app.post("/api/assistant")
 async def submit_assistant_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Run the single-brain assistant for a user request and stream status updates."""
     if settings.lockdown_mode:

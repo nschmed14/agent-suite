@@ -10,19 +10,14 @@ function getBackendHost() {
 
 function getBackendBaseUrl() {
   const override = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
-  const port = override ? String(override) : '8011';
+  const port = override ? String(override) : '8000';
   return `${window.location.protocol}//${getBackendHost()}:${port}`;
 }
 
 class UIOverlay {
   constructor(scene) {
     this.scene = scene;
-    this.messages = [
-      {
-        role: 'assistant',
-        text: 'Hello. I can help you coordinate the office, assign tasks, and keep the manager informed.',
-      },
-    ];
+    this.messages = [];
     this.lastAssistantMessageText = null;
 
     this.container = document.createElement('div');
@@ -97,11 +92,6 @@ class UIOverlay {
     this.historyPanel.style.boxShadow = '0 18px 45px rgba(0,0,0,0.12)';
     shell.appendChild(this.historyPanel);
 
-    const historyHeader = document.createElement('div');
-    historyHeader.innerHTML = '<strong>Conversation box</strong>';
-    historyHeader.style.marginBottom = '12px';
-    historyHeader.style.color = '#1f2630';
-    this.historyPanel.appendChild(historyHeader);
 
     this.historyEl = document.createElement('div');
     this.historyEl.style.flex = '1';
@@ -255,12 +245,24 @@ class UIOverlay {
     this.renderMessages();
   }
 
-  setResponse(message, modelStatus = 'unknown') {
-    if (!message) {
-      return;
+  cleanAssistantText(text) {
+    if (text === null || text === undefined) {
+      return '';
     }
 
-    const normalizedMessage = String(message).trim();
+    const normalized = String(text).trim();
+    if (!normalized) {
+      return '';
+    }
+
+    return normalized
+      .replace(/^AGENT:\s*\w+\s*TASK:\s*/i, '')
+      .replace(/^\[[^\]]+\]\s*/, '')
+      .trim();
+  }
+
+  setResponse(message, modelStatus = 'unknown') {
+    const normalizedMessage = this.cleanAssistantText(message);
     if (!normalizedMessage) {
       return;
     }
@@ -306,13 +308,27 @@ class UIOverlay {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ request: requestText }),
     })
-      .then((response) => response.json())
-      .then((payload) => {
-        if (payload && payload.response) {
-          this.setResponse(payload.response, payload.model_status || 'unknown');
+      .then(async (response) => {
+        let payload = null;
+        try {
+          payload = await response.json();
+        } catch (error) {
+          payload = null;
+        }
+
+        if (!response.ok) {
+          throw new Error(payload?.detail || 'Assistant request failed');
+        }
+
+        const displayText = payload?.response || payload?.final_response || payload?.message || payload?.result?.message || '';
+        if (displayText) {
+          this.setResponse(displayText, payload?.model_status || 'unknown');
+        } else {
+          this.setStatus('The assistant returned an empty response');
         }
       })
-      .catch(() => {
+      .catch((error) => {
+        console.error('Assistant request failed', error);
         this.setStatus('Local backend unavailable');
         this.appendMessage('assistant', 'The local assistant could not be reached.');
       });

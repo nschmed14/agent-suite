@@ -10,7 +10,7 @@ function getBackendHost() {
 
 function getBackendWsUrl() {
   const override = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
-  const port = override ? String(override) : '8011';
+  const port = override ? String(override) : '8000';
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
   return `${protocol}://${getBackendHost()}:${port}/office`;
 }

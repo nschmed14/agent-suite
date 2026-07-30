@@ -32,6 +32,10 @@ venv/
 /data/
 data/chroma/
 
+# Google OAuth credentials and tokens
+backend/credentials/
+*.pickle
+
 # Local runtime and build artifacts
 node_modules/
 dist/
