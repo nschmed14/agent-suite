@@ -236,6 +236,7 @@ def get_events(service: Any | None = None, days: int = 7) -> List[dict[str, Any]
         events = events_result.get("items", [])
         return [
             {
+                "id": event.get("id"),
                 "summary": event.get("summary", "(No title)"),
                 "start": event.get("start", {}).get("dateTime") or event.get("start", {}).get("date"),
                 "end": event.get("end", {}).get("dateTime") or event.get("end", {}).get("date"),
@@ -248,6 +249,7 @@ def get_events(service: Any | None = None, days: int = 7) -> List[dict[str, Any]
                 payload = json.loads(FALLBACK_EVENTS_PATH.read_text())
                 return [
                     {
+                        "id": item.get("id"),
                         "summary": item.get("summary", "(No title)"),
                         "start": item.get("start"),
                         "end": item.get("end"),
@@ -380,6 +382,35 @@ def create_event(
             recurrence=recurrence,
         )
         return f"{fallback_id} (local fallback; original error: {exc})"
+
+
+def _delete_fallback_event(event_id: str) -> bool:
+    """Remove a persisted fallback event by id. Returns True if a matching event was found and removed."""
+    if not FALLBACK_EVENTS_PATH.exists():
+        return False
+    try:
+        events = json.loads(FALLBACK_EVENTS_PATH.read_text())
+    except Exception:
+        return False
+
+    remaining = [item for item in events if item.get("id") != event_id]
+    if len(remaining) == len(events):
+        return False
+
+    FALLBACK_EVENTS_PATH.write_text(json.dumps(remaining, indent=2))
+    return True
+
+
+def delete_event(event_id: str) -> str:
+    """Delete an event from the user's primary calendar and return a status string."""
+    try:
+        service = authenticate_google_calendar()
+        service.events().delete(calendarId="primary", eventId=event_id).execute()
+        return event_id
+    except Exception as exc:
+        if _delete_fallback_event(event_id):
+            return f"{event_id} (removed local fallback entry; original error: {exc})"
+        return f"{event_id} (local fallback lookup failed; original error: {exc})"
 
 
 def update_event(

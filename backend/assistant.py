@@ -17,7 +17,24 @@ from typing import Any, Awaitable, Callable, Dict, List
 
 from backend.config import Settings
 from backend.memory import LocalMemory
-from backend.tools.calendar_tool import create_event, get_events, update_event
+from backend.tools.calendar_tool import create_event, delete_event, get_events, update_event
+
+# Marks the start of a new meeting/appointment clause within a scheduling request: either the
+# very start of the request, or a comma/semicolon/connector word ("and", "then", "next", "also",
+# "first", "after that", "afterwards") immediately followed (allowing an optional verb like
+# "schedule" or "book", an optional "I have", and an optional article) by "meeting(s)" or
+# "appointment(s)". Requiring the noun to appear right after the boundary is what keeps this from
+# firing on an "and" that is merely joining two attendees of one meeting (e.g. "with both Stacy
+# and Carol") or on unrelated commas elsewhere in the sentence (attendee emails, a location, a
+# description) -- those are never immediately followed by a fresh "a meeting"/"an appointment".
+_CLAUSE_START_RE = re.compile(
+    r"(?:^|(?:,\s*|;\s*)?\b(?:and|then|next|also|first|after(?:\s+that)?|afterwards)\b\s*|,\s*|;\s*)"
+    r"(?:(?:schedule|book|create|set up)\s+)?"
+    r"(?:i have\s+)?"
+    r"(?:a|an|another|one)?\s*"
+    r"(?:meetings?|appointments?)\b",
+    re.IGNORECASE,
+)
 
 
 def _load_ollama_client():
@@ -208,8 +225,121 @@ class Assistant:
             return True
         return False
 
-    def _extract_scheduling_details(self, task: str) -> Dict[str, Any]:
-        """Extract the most relevant scheduling fields from the current request and, for true follow-ups, recent conversation history."""
+    _TIME_OF_DAY_RE = re.compile(
+        r"\b(\d{1,2})(?::?(\d{2}))?\s*(am|pm)?\b(?!\s*(?:minute|minutes|hour|hours)\b)",
+        re.IGNORECASE,
+    )
+
+    def _parse_time_of_day(self, text: str) -> str | None:
+        """Parse a clock time like "2pm", "14:30", or "noon" from text into "HH:MM", or None.
+
+        Accepts an explicit am/pm hour (1-12) or an unambiguous 24-hour hour (13-23 or 0) without
+        needing am/pm. Previously any hour above 12 was rejected outright even when unambiguous
+        (e.g. "17:00"), which incorrectly triggered a request for clarification on a time the user
+        had already given. A bare hour from 1-12 with no am/pm ("at 5") is genuinely ambiguous
+        between morning and afternoon, so it is treated as no time given rather than silently
+        assumed to be AM -- callers should ask the user to say which they meant (see
+        _detect_ambiguous_hour).
+        """
+        lowered = (text or "").strip().lower()
+        if not lowered:
+            return None
+        if "noon" in lowered:
+            return "12:00"
+
+        match = self._TIME_OF_DAY_RE.search(lowered)
+        if not match:
+            return None
+
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        meridiem = (match.group(3) or "").lower()
+
+        if hour > 23 or minute > 59:
+            return None
+        if hour > 12 and meridiem:
+            return None
+        if 1 <= hour <= 12 and not meridiem:
+            return None
+
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        if meridiem == "am" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:{minute:02d}"
+
+    def _detect_ambiguous_hour(self, text: str) -> int | None:
+        """Return the bare 1-12 hour in text that has no am/pm marker (e.g. the 5 in "at 5"), or
+        None if there is no such ambiguity. Used to ask "did you mean 5 AM or PM?" instead of the
+        generic "I still need the time" when the user did give a time but it was ambiguous.
+        """
+        lowered = (text or "").strip().lower()
+        if not lowered or "noon" in lowered:
+            return None
+
+        match = self._TIME_OF_DAY_RE.search(lowered)
+        if not match:
+            return None
+
+        hour = int(match.group(1))
+        meridiem = (match.group(3) or "").lower()
+        if 1 <= hour <= 12 and not meridiem:
+            return hour
+        return None
+
+    _PARTICIPANT_STOP_WORDS_RE = re.compile(
+        r"\b(?:for|at|on|to|tomorrow|today|next|this|starting|invite|description|location|in|from)\b",
+        re.IGNORECASE,
+    )
+
+    def _extract_participant_phrase(self, lowered_text: str) -> str | None:
+        """Extract who a meeting is with from the phrase following "with".
+
+        Captures up to a few words rather than a single token, so a collective reference such as
+        "the whole team" is kept together instead of only grabbing the stopword "the" (which
+        previously produced a nonsense title like "Meeting with The").
+        """
+        match = re.search(r"\bwith\s+((?:[a-z0-9._-]+\s*){1,4})", lowered_text)
+        if not match:
+            return None
+
+        phrase = match.group(1)
+        stop_match = self._PARTICIPANT_STOP_WORDS_RE.search(phrase)
+        if stop_match:
+            phrase = phrase[: stop_match.start()]
+        phrase = re.sub(r"\s+", " ", phrase).strip()
+        return phrase or None
+
+    def _extract_location_phrase(self, lowered_text: str) -> str | None:
+        """Extract a meeting location from phrasing like "conference room", "location: X",
+        "set the address to X", or "at the X". Shared by event creation and by updating an
+        existing event's location so both recognize the same phrasings consistently.
+        """
+        if "conference room" in lowered_text:
+            return "conference room"
+        if "location:" in lowered_text:
+            match = re.search(r"location\s*:\s*([a-z0-9 ._\-]+)", lowered_text)
+            if match:
+                return match.group(1).strip().title()
+        elif re.search(r"\b(?:address|location)\b", lowered_text):
+            match = re.search(r"\b(?:address|location)\b(?:\s+(?:is|to))?\s*(?:the\s+)?([a-z0-9 ._\-]+)", lowered_text)
+            if match:
+                return match.group(1).strip().title()
+        elif " at the " in lowered_text:
+            match = re.search(r"\bat the ([a-z0-9 ._\-]+)", lowered_text)
+            if match:
+                return match.group(1).strip().title()
+        return None
+
+    def _extract_scheduling_details(self, task: str, use_history: bool = True) -> Dict[str, Any]:
+        """Extract the most relevant scheduling fields from the current request and, for true follow-ups, recent conversation history.
+
+        Pass use_history=False to parse the given text in isolation, ignoring conversation
+        follow-up context entirely. This is used when evaluating one clause of a compound
+        scheduling request (e.g. the second meeting in "schedule X, and schedule Y"), where the
+        clause is itself a substring of the current turn and must not be treated as a follow-up
+        to its own parent request.
+        """
         details: Dict[str, Any] = {"participant": None, "title": None, "date": None, "time": None, "duration": None}
         texts: List[str] = []
 
@@ -217,31 +347,28 @@ class Assistant:
         if normalized_task:
             texts.append(normalized_task)
 
-        if self._looks_like_reschedule_request(normalized_task):
-            last_event_context = self._extract_last_event_context()
-            summary = str(last_event_context.get("summary") or "").strip()
-            if summary:
-                texts.append(summary)
-        else:
-            previous_request = self._get_previous_user_request(normalized_task)
-            if self._should_use_prior_scheduling_context(normalized_task, previous_request):
-                for entry in self._conversation_history:
-                    if entry.get("role") != "user":
-                        continue
-                    content = str(entry.get("content", "")).strip()
-                    if content:
-                        texts.append(content)
+        if use_history:
+            if self._looks_like_reschedule_request(normalized_task):
+                last_event_context = self._extract_last_event_context()
+                summary = str(last_event_context.get("summary") or "").strip()
+                if summary:
+                    texts.append(summary)
+            else:
+                previous_request = self._get_previous_user_request(normalized_task)
+                if self._should_use_prior_scheduling_context(normalized_task, previous_request):
+                    for entry in self._conversation_history:
+                        if entry.get("role") != "user":
+                            continue
+                        content = str(entry.get("content", "")).strip()
+                        if content:
+                            texts.append(content)
 
         for text in texts:
             lowered = (text or "").strip().lower()
             if details["participant"] is None:
-                participant_match = re.search(r"\bwith\s+([a-z0-9._-]+)", lowered)
-                if participant_match:
-                    participant = participant_match.group(1).strip()
-                    participant = re.sub(r"\b(for|at|on|tomorrow|today|next|this)\b.*$", "", participant)
-                    participant = re.sub(r"\s+", " ", participant).strip()
-                    if participant:
-                        details["participant"] = participant
+                participant = self._extract_participant_phrase(lowered)
+                if participant:
+                    details["participant"] = participant
 
             if details["title"] is None:
                 title_match = re.search(
@@ -267,22 +394,9 @@ class Assistant:
                             break
 
             if details["time"] is None:
-                if "noon" in lowered:
-                    details["time"] = "12:00"
-                else:
-                    time_match = re.search(r"\b(\d{1,2})(?::?(\d{2}))?\s*(am|pm)?\b(?!\s*(minute|minutes|hour|hours)\b)", lowered)
-                    if time_match:
-                        hour = int(time_match.group(1))
-                        minute = int(time_match.group(2) or 0)
-                        meridiem = (time_match.group(3) or "").lower()
-                        if hour > 12 and not meridiem:
-                            time_match = None
-                        else:
-                            if meridiem == "pm" and hour < 12:
-                                hour += 12
-                            if meridiem == "am" and hour == 12:
-                                hour = 0
-                            details["time"] = f"{hour:02d}:{minute:02d}"
+                parsed_time = self._parse_time_of_day(lowered)
+                if parsed_time is not None:
+                    details["time"] = parsed_time
 
             if details["duration"] is None:
                 duration_minutes = self._extract_duration_minutes(text)
@@ -402,6 +516,130 @@ class Assistant:
                 return None
         return amount if unit.startswith("minute") or unit in {"min", "mins", "m"} else amount * 60
 
+    def _looks_like_cancel_request(self, task: str) -> bool:
+        """Return True when the request is asking to cancel or delete an existing meeting."""
+        lowered = (task or "").strip().lower()
+        if not lowered:
+            return False
+        if not re.search(r"\b(?:cancel|delete|remove)\b", lowered):
+            return False
+        return bool(re.search(r"\b(?:meeting|event|appointment|call)\b", lowered))
+
+    async def _cancel_calendar_event(self, task: str) -> str:
+        """Find and delete the calendar event matching a cancel/delete request.
+
+        Matches on the requested day (if any) and on the participant/title mentioned in the
+        request, since the user refers to meetings by who they are with or what they are about,
+        not by an internal event ID.
+        """
+        requested_day = self._extract_requested_day(task, datetime.now())
+        details = self._extract_scheduling_details(task, use_history=False)
+        search_term = (details.get("participant") or details.get("title") or "").strip().lower()
+
+        events = get_events(days=60)
+        candidates = []
+        for event in events:
+            if requested_day and self._get_event_date(event) != requested_day:
+                continue
+            summary = str(event.get("summary") or "")
+            if search_term and search_term not in summary.lower():
+                continue
+            candidates.append(event)
+
+        if not candidates:
+            return "I couldn't find a matching meeting on your calendar to cancel."
+
+        if len(candidates) > 1:
+            options = "; ".join(f"'{c.get('summary')}' at {c.get('start')}" for c in candidates)
+            return f"I found more than one matching meeting ({options}). Which one should I cancel?"
+
+        event = candidates[0]
+        event_id = event.get("id")
+        summary = event.get("summary") or "that meeting"
+        if not event_id:
+            return f"I found '{summary}' but couldn't determine its event ID to cancel it."
+
+        delete_event(event_id)
+        return f"🗑️ I canceled '{summary}'."
+
+    def _looks_like_detail_update_request(self, task: str) -> bool:
+        """Return True when the request asks to change a meeting's location or attendees.
+
+        Deliberately distinct from a reschedule request, which changes the meeting's time --
+        "change the location of my meeting with Hannah to the conference room" should not go
+        through the time-focused reschedule flow.
+        """
+        lowered = (task or "").strip().lower()
+        if not lowered:
+            return False
+        if not re.search(r"\b(?:meeting|event|appointment)\b", lowered):
+            return False
+
+        wants_location_change = bool(re.search(r"\b(?:location|address|venue)\b", lowered)) and bool(
+            re.search(r"\b(?:change|update|set)\b", lowered)
+        )
+        wants_attendee_change = bool(re.search(r"\b(?:invite|add)\b", lowered)) and bool(re.search(r"\bto\b", lowered))
+        return wants_location_change or wants_attendee_change
+
+    async def _update_calendar_event_details(self, task: str) -> str:
+        """Change an existing meeting's location and/or attendees without touching its time.
+
+        Looks the meeting up directly on the real calendar (rather than this conversation's
+        history) because updating it means resending its whole event body -- update_event has no
+        way to patch a single field -- so the current start/end time must come from an
+        authoritative source, not a coarse HH:MM string that reschedule's session-context tracking
+        keeps.
+        """
+        details = self._extract_scheduling_details(task, use_history=False)
+        search_term = (details.get("participant") or details.get("title") or "").strip().lower()
+        if not search_term:
+            return "I don't have a calendar event to update -- who is the meeting with, or what is it called?"
+
+        events = get_events(days=60)
+        candidates = [event for event in events if search_term in str(event.get("summary") or "").lower()]
+        if not candidates:
+            return "I couldn't find a matching meeting on your calendar to update."
+        if len(candidates) > 1:
+            options = "; ".join(f"'{c.get('summary')}' at {c.get('start')}" for c in candidates)
+            return f"I found more than one matching meeting ({options}). Which one did you mean?"
+
+        event = candidates[0]
+        event_id = event.get("id")
+        summary = event.get("summary") or "that meeting"
+        if not event_id:
+            return f"I found '{summary}' but couldn't determine its event ID to update it."
+
+        lowered = task.lower()
+        new_location = self._extract_location_phrase(lowered)
+        new_attendees = re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", task)
+
+        if not new_location and not new_attendees:
+            return f"I found '{summary}' but couldn't tell what to change -- what should the new location or attendee be?"
+
+        update_kwargs: Dict[str, Any] = {
+            "event_id": event_id,
+            "summary": summary,
+            "start_time": event.get("start"),
+            "end_time": event.get("end"),
+        }
+        if new_location:
+            update_kwargs["location"] = new_location
+        if new_attendees:
+            update_kwargs["attendees"] = new_attendees
+
+        updated_event_id = update_event(**update_kwargs)
+
+        changes = []
+        if new_location:
+            changes.append(f"location to {new_location}")
+        if new_attendees:
+            changes.append(f"attendees to include {', '.join(new_attendees)}")
+        change_summary = " and ".join(changes)
+
+        if "local fallback" in str(updated_event_id).lower():
+            return f"⚠️ I updated the {change_summary} for '{summary}' and saved a local backup entry. Backup ID: {updated_event_id}"
+        return f"✅ I updated the {change_summary} for '{summary}'."
+
     def _looks_like_availability_request(self, task: str) -> bool:
         """Return True when the request is asking for a suggested or available meeting slot."""
         lowered = (task or "").strip().lower()
@@ -419,6 +657,39 @@ class Assistant:
         if "what time works" in lowered or "what works" in lowered:
             return True
         return False
+
+    def _event_time_range(self, event: Dict[str, Any], local_tz: Any) -> "tuple[datetime, datetime] | None":
+        """Return an event's (start, end) as timezone-aware datetimes in local_tz, or None if unparseable."""
+        start_value = event.get("start")
+        end_value = event.get("end")
+        if not start_value or not end_value:
+            return None
+        try:
+            event_start = datetime.fromisoformat(str(start_value).replace("Z", "+00:00"))
+            event_end = datetime.fromisoformat(str(end_value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+        if event_start.tzinfo is None:
+            event_start = event_start.replace(tzinfo=local_tz)
+        if event_end.tzinfo is None:
+            event_end = event_end.replace(tzinfo=local_tz)
+
+        return event_start.astimezone(local_tz), event_end.astimezone(local_tz)
+
+    def _find_conflicting_events(
+        self, events: List[Dict[str, Any]], start_dt: datetime, end_dt: datetime, local_tz: Any
+    ) -> List[Dict[str, Any]]:
+        """Return events from the given list that overlap the [start_dt, end_dt) window."""
+        conflicts = []
+        for event in events:
+            time_range = self._event_time_range(event, local_tz)
+            if time_range is None:
+                continue
+            event_start, event_end = time_range
+            if start_dt < event_end and end_dt > event_start:
+                conflicts.append(event)
+        return conflicts
 
     async def _suggest_available_time(self, task: str) -> str:
         """Suggest the earliest free slot for a meeting on the requested day."""
@@ -445,30 +716,7 @@ class Assistant:
 
         for candidate_start in candidate_starts:
             candidate_end = candidate_start + timedelta(minutes=duration_minutes)
-            conflict = False
-            for event in requested_events:
-                start_value = event.get("start")
-                end_value = event.get("end")
-                if not start_value or not end_value:
-                    continue
-                try:
-                    event_start = datetime.fromisoformat(str(start_value).replace("Z", "+00:00"))
-                    event_end = datetime.fromisoformat(str(end_value).replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-
-                if event_start.tzinfo is None:
-                    event_start = event_start.replace(tzinfo=local_tz)
-                if event_end.tzinfo is None:
-                    event_end = event_end.replace(tzinfo=local_tz)
-
-                event_start = event_start.astimezone(local_tz)
-                event_end = event_end.astimezone(local_tz)
-
-                if candidate_start < event_end and candidate_end > event_start:
-                    conflict = True
-                    break
-            if not conflict:
+            if not self._find_conflicting_events(requested_events, candidate_start, candidate_end, local_tz):
                 return f"I suggest {candidate_start.strftime('%H:%M')} for {requested_day}."
 
         return f"I don't see a clear opening on {requested_day}."
@@ -577,6 +825,9 @@ class Assistant:
             return {"agent": "manager", "task": normalized}
 
         if self._looks_like_reschedule_request(normalized):
+            return {"agent": "scheduler", "task": normalized}
+
+        if self._looks_like_cancel_request(normalized):
             return {"agent": "scheduler", "task": normalized}
 
         schedule_terms = ["schedule", "meeting", "calendar", "appointment", "book", "reserve", "conference room", "create a", "create an", "create"]
@@ -746,6 +997,14 @@ If unclear, default to Manager with the task as-is.
         await self._emit_status("working", "calendar", "Accessing your calendar...", 0.5)
 
         try:
+            if self._looks_like_cancel_request(task):
+                result = await self._cancel_calendar_event(task)
+                return {"status": "done", "message": result}
+
+            if self._looks_like_detail_update_request(task):
+                result = await self._update_calendar_event_details(task)
+                return {"status": "done", "message": result}
+
             if self._looks_like_availability_request(task):
                 result = await self._suggest_available_time(task)
                 return {"status": "done", "message": result}
@@ -768,37 +1027,28 @@ If unclear, default to Manager with the task as-is.
             return {"status": "done", "message": f"Calendar error: {str(exc)}"}
 
     def _split_calendar_steps(self, task: str) -> List[str]:
-        """Split a multi-step scheduling request into individual instructions."""
+        """Split a multi-meeting scheduling request into individual meeting instructions.
+
+        Splits at each point _CLAUSE_START_RE finds a new meeting/appointment being introduced,
+        so qualifiers that follow a clause (a time, a duration, "both half an hour") stay attached
+        to it up until the next such boundary, instead of relying on a comma plus a specific
+        trigger word both being present (which missed plain phrasings like "..., and a meeting
+        with Will on Friday").
+        """
         normalized = (task or "").strip()
         if not normalized:
             return []
 
-        if not re.search(r"\b(?:first|then|next|after(?:\s+that)?|afterwards|also)\b", normalized, re.IGNORECASE):
-            return [normalized]
-
-        segments = [segment.strip() for segment in re.split(r"[,;]\s*", normalized) if segment and segment.strip()]
-        if len(segments) <= 1:
+        boundaries = sorted({0, *(match.start() for match in _CLAUSE_START_RE.finditer(normalized))})
+        if len(boundaries) <= 1:
             return [normalized]
 
         steps = []
-        for segment in segments:
-            lowered = segment.lower()
-            if "with both" in lowered or ("both" in lowered and "and" in lowered):
-                steps.append(segment)
-            elif re.search(r"\b(?:meeting|schedule|book|create)\b", lowered):
-                if steps and re.search(r"\b(?:john|hannah|stacy|carol)\b", lowered):
-                    steps.append(segment)
-                else:
-                    steps.append(segment)
-            else:
-                if steps:
-                    steps[-1] = f"{steps[-1]} {segment}".strip()
-                else:
-                    steps.append(segment)
-
-        if not steps:
-            return [normalized]
-        return steps
+        for start, end in zip(boundaries, boundaries[1:] + [len(normalized)]):
+            clause = normalized[start:end].strip()
+            if clause:
+                steps.append(clause)
+        return steps or [normalized]
 
     def _extract_contextual_title(self, task: str) -> str | None:
         """Infer a meeting title from the current request and earlier scheduling context when it is a short follow-up."""
@@ -823,13 +1073,9 @@ If unclear, default to Manager with the task as-is.
                 continue
             content_lower = content.lower()
             if entry.get("role") == "user":
-                participant_match = re.search(r"\bwith\s+([a-z0-9._-]+)", content_lower)
-                if participant_match:
-                    participant = participant_match.group(1).strip()
-                    participant = re.sub(r"\b(for|at|on|tomorrow|today|next|this)\b.*$", "", participant)
-                    participant = re.sub(r"\s+", " ", participant).strip()
-                    if participant:
-                        return f"Meeting with {participant.title()}"
+                participant = self._extract_participant_phrase(content_lower)
+                if participant:
+                    return f"Meeting with {participant.title()}"
 
                 if any(term in content_lower for term in ["schedule", "meeting", "book", "reserve", "calendar"]):
                     summary_match = re.search(r"(?:schedule|create|book|set)\s+(?:a|an)?\s+([a-z0-9 ._\-]+)", content, re.IGNORECASE)
@@ -874,13 +1120,9 @@ If unclear, default to Manager with the task as-is.
                 title = inferred_title[0].upper() + inferred_title[1:] if inferred_title else inferred_title
 
         if "with " in lowered:
-            match = re.search(r"\bwith\s+([a-z0-9._-]+)", lowered)
-            if match:
-                participant = match.group(1).strip()
-                participant = re.sub(r"\b(for|at|on|tomorrow|today|next|this)\b.*$", "", participant)
-                participant = re.sub(r"\s+", " ", participant).strip()
-                if participant:
-                    title = f"Meeting with {participant.title()}"
+            participant = self._extract_participant_phrase(lowered)
+            if participant:
+                title = f"Meeting with {participant.title()}"
 
         contextual_title = self._extract_contextual_title(normalized_task)
         if contextual_title and title.lower() in {"meeting", "event", "meeting or event"}:
@@ -902,20 +1144,7 @@ If unclear, default to Manager with the task as-is.
 
         attendees = re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", normalized_task)
 
-        if "conference room" in lowered:
-            location = "conference room"
-        elif "location:" in lowered:
-            location_match = re.search(r"location\s*:\s*([a-z0-9 ._\-]+)", lowered)
-            if location_match:
-                location = location_match.group(1).strip().title()
-        elif re.search(r"\b(?:address|location)\b", lowered):
-            location_match = re.search(r"\b(?:address|location)\b(?:\s+(?:is|to))?\s*(?:the\s+)?([a-z0-9 ._\-]+)", lowered)
-            if location_match:
-                location = location_match.group(1).strip().title()
-        elif " at the " in lowered:
-            location_match = re.search(r"\bat the ([a-z0-9 ._\-]+)", lowered)
-            if location_match:
-                location = location_match.group(1).strip().title()
+        location = self._extract_location_phrase(lowered)
 
         if "weekly recurring" in lowered or "every week" in lowered:
             weekday_match = re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?\b", lowered)
@@ -941,24 +1170,10 @@ If unclear, default to Manager with the task as-is.
         date = requested_date or base_date or default_date
 
         start_time = base_time or default_start_time
-        time_match = None
-        if "noon" in lowered:
-            start_time = "12:00"
-            time_match = True
-        else:
-            time_match = re.search(r"\b(\d{1,2})(?::?(\d{2}))?\s*(am|pm)?\b(?!\s*(minute|minutes|hour|hours)\b)", lowered)
-            if time_match:
-                hour = int(time_match.group(1))
-                minute = int(time_match.group(2) or 0)
-                meridiem = (time_match.group(3) or "").lower()
-                if hour > 12 and not meridiem:
-                    time_match = None
-                else:
-                    if meridiem == "pm" and hour < 12:
-                        hour += 12
-                    if meridiem == "am" and hour == 12:
-                        hour = 0
-                    start_time = f"{hour:02d}:{minute:02d}"
+        parsed_time = self._parse_time_of_day(lowered)
+        time_match = parsed_time is not None
+        if parsed_time is not None:
+            start_time = parsed_time
 
         duration = default_duration_minutes
         duration_match = None
@@ -1093,8 +1308,13 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
         for day_name, weekday in weekday_names.items():
             if day_name in lowered:
                 days_ahead = (weekday - now.weekday()) % 7
-                if "next" in lowered and days_ahead == 0:
-                    days_ahead = 7
+                # "next <day>" means the day after the nearest upcoming one, not the nearest one
+                # itself -- e.g. said on a Monday, "this Friday" is 4 days out but "next Friday"
+                # is 11 days out. Previously "next" only pushed the date out when the nearest
+                # occurrence was today, so "next Friday" and "this Friday" resolved to the same
+                # date on every other day of the week.
+                if re.search(rf"\bnext\s+{day_name}\b", lowered):
+                    days_ahead += 7
                 return (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
         return None
@@ -1125,8 +1345,12 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
         if not details.get("date"):
             missing.append("the date")
 
+        ambiguous_hour = self._detect_ambiguous_hour(task)
         if not details.get("time"):
-            missing.append("the time")
+            if ambiguous_hour is not None:
+                missing.append(f"whether {ambiguous_hour} is AM or PM")
+            else:
+                missing.append("the time")
 
         if details.get("duration") is None:
             missing.append("how long it should last")
@@ -1148,6 +1372,76 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
             return f"I can help with that, but I still need {detail_list} before I schedule it{context_hint} for {details['date']}."
 
         return f"I can help with that, but I need to know {detail_list} before I schedule it{context_hint}."
+
+    def _step_needs_clarification(self, step: str, context_date: str | None = None, context_time: str | None = None) -> bool:
+        """Return True when one clause of a compound scheduling request lacks enough detail.
+
+        Unlike _needs_clarification, this evaluates the clause on its own (use_history=False)
+        so that a later clause such as "and a meeting with Will next Friday" is not mistaken for
+        a conversational follow-up to the very request it is part of. context_date/context_time
+        let a clause without its own date or time inherit one from an earlier clause in the same
+        compound request, mirroring how _parse_single_calendar_instruction chains base_date and
+        base_time across sequential steps when it actually creates the events.
+        """
+        lowered = (step or "").strip().lower()
+        if not lowered:
+            return False
+        if not self._looks_like_scheduling_request(step):
+            return False
+
+        details = self._extract_scheduling_details(step, use_history=False)
+        has_multi_participants = bool(re.search(r"\bwith\b(?:\s+both)?\s+[a-z0-9._-]+\s+and\s+[a-z0-9._-]+", lowered))
+        has_topic = bool(details.get("participant") or details.get("title")) or has_multi_participants
+        has_date = details.get("date") is not None or context_date is not None
+        has_time = details.get("time") is not None or context_time is not None
+        has_duration = details.get("duration") is not None
+
+        if not has_topic or not has_date or not has_time:
+            return True
+
+        if not has_duration and not (details.get("title") and details.get("title").lower() not in {"meeting", "event", "an event", "a meeting"}):
+            return True
+
+        return False
+
+    def _build_multi_step_clarification_response(self, incomplete_steps: List[tuple]) -> str:
+        """Build one combined clarification message covering every incomplete meeting in a compound request."""
+        clauses: List[str] = []
+        for step, details in incomplete_steps:
+            missing: List[str] = []
+            if not details.get("participant") and not details.get("title"):
+                missing.append("who it's with or what it's about")
+            if not details.get("date"):
+                missing.append("the date")
+            if not details.get("time"):
+                ambiguous_hour = self._detect_ambiguous_hour(step)
+                if ambiguous_hour is not None:
+                    missing.append(f"whether {ambiguous_hour} is AM or PM")
+                else:
+                    missing.append("the time")
+            if details.get("duration") is None:
+                missing.append("how long it should last")
+            if not missing:
+                continue
+
+            detail_list = ", ".join(missing[:-1]) + f" and {missing[-1]}" if len(missing) > 1 else missing[0]
+
+            if details.get("participant"):
+                label = f"the meeting with {details['participant'].title()}"
+            elif details.get("title"):
+                label = f"the {details['title']} meeting"
+            else:
+                label = "one of the meetings"
+            if details.get("date"):
+                label = f"{label} on {details['date']}"
+
+            clauses.append(f"{detail_list} for {label}")
+
+        if not clauses:
+            return "I can help with that, but I need a bit more detail before I schedule these."
+        if len(clauses) == 1:
+            return f"I can help with that, but I still need {clauses[0]}."
+        return "I can help with that, but I still need " + ", and ".join(clauses) + "."
 
     def _needs_clarification(self, task: str) -> bool:
         """Return True when a scheduling request lacks enough details to act without guessing."""
@@ -1197,22 +1491,8 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
 
     def _extract_requested_time(self, task: str, default_time: str = "09:00") -> str:
         """Extract an explicit time from the request, if present."""
-        lowered = (task or "").strip().lower()
-        if "noon" in lowered:
-            return "12:00"
-
-        match = re.search(r"\b(\d{1,2})(?::?(\d{2}))?\s*(am|pm)?\b", lowered)
-        if not match:
-            return default_time
-
-        hour = int(match.group(1))
-        minute = int(match.group(2) or 0)
-        meridiem = (match.group(3) or "").lower()
-        if meridiem == "pm" and hour < 12:
-            hour += 12
-        if meridiem == "am" and hour == 12:
-            hour = 0
-        return f"{hour:02d}:{minute:02d}"
+        parsed_time = self._parse_time_of_day(task)
+        return parsed_time if parsed_time is not None else default_time
 
     def _extract_requested_date(self, task: str, fallback_date: str | None = None) -> str | None:
         """Extract a date from the request or fall back to the last known event date."""
@@ -1260,10 +1540,10 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
                 prior_request = str(entry.get("content", ""))
                 break
         if prior_request:
-            participant_match = re.search(r"\bwith\s+([a-z0-9._-]+)", prior_request.lower())
-            if participant_match:
+            participant = self._extract_participant_phrase(prior_request.lower())
+            if participant:
                 return {
-                    "summary": f"Meeting with {participant_match.group(1).title()}",
+                    "summary": f"Meeting with {participant.title()}",
                     "event_id": None,
                     "date": None,
                     "time": None,
@@ -1271,11 +1551,37 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
         return {}
 
     async def _reschedule_calendar_event(self, task: str) -> str:
-        """Update the latest created event in the conversation history."""
+        """Update an existing meeting's time.
+
+        Prefers an event created or mentioned earlier in this conversation. If none exists -- for
+        example, this is the first message of a new session -- falls back to searching the real
+        calendar for a meeting matching who/what the request names. Unlike cancellation, this
+        search does not filter by the date parsed from the request, since a reschedule request's
+        date/time normally describes the NEW slot the user wants, not the meeting's current one.
+        """
         context = self._extract_last_event_context()
         event_id = context.get("event_id")
+        summary = context.get("summary")
+
         if not event_id:
-            return "I don't have a calendar event to reschedule in this conversation yet."
+            details = self._extract_scheduling_details(task, use_history=False)
+            search_term = (details.get("participant") or details.get("title") or summary or "").strip().lower()
+            candidates = []
+            if search_term:
+                events = get_events(days=60)
+                candidates = [event for event in events if search_term in str(event.get("summary") or "").lower()]
+
+            if not candidates:
+                return "I don't have a calendar event to reschedule in this conversation yet."
+            if len(candidates) > 1:
+                options = "; ".join(f"'{c.get('summary')}' at {c.get('start')}" for c in candidates)
+                return f"I found more than one matching meeting ({options}). Which one should I reschedule?"
+
+            found_event = candidates[0]
+            event_id = found_event.get("id")
+            summary = found_event.get("summary") or summary
+            if not event_id:
+                return f"I found '{summary}' but couldn't determine its event ID to reschedule it."
 
         now = datetime.now()
         local_tz = now.astimezone().tzinfo or timezone.utc
@@ -1293,7 +1599,7 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
 
         start_dt = datetime.strptime(f"{requested_date}T{requested_time}", "%Y-%m-%dT%H:%M").replace(tzinfo=local_tz)
         end_dt = start_dt + timedelta(minutes=duration_minutes)
-        summary = context.get("summary") or "Meeting"
+        summary = summary or "Meeting"
 
         updated_event_id = update_event(
             event_id=event_id,
@@ -1319,17 +1625,38 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
         if self._looks_like_reschedule_request(normalized_task):
             return await self._reschedule_calendar_event(normalized_task)
 
-        if self._needs_clarification(normalized_task):
-            return self._build_clarification_response(normalized_task)
-
         contextual_task = self._build_contextual_request(normalized_task)
         steps = self._split_calendar_steps(contextual_task)
         if not steps:
             steps = [contextual_task]
 
+        if len(steps) == 1:
+            if self._needs_clarification(normalized_task):
+                return self._build_clarification_response(normalized_task)
+        else:
+            incomplete_steps = []
+            context_date = None
+            context_time = None
+            for step in steps:
+                details = self._extract_scheduling_details(step, use_history=False)
+                effective_date = details.get("date") or context_date
+                effective_time = details.get("time") or context_time
+                if self._step_needs_clarification(step, context_date=context_date, context_time=context_time):
+                    merged_details = dict(details)
+                    merged_details["date"] = effective_date
+                    merged_details["time"] = effective_time
+                    incomplete_steps.append((step, merged_details))
+                if effective_date:
+                    context_date = effective_date
+                if effective_time:
+                    context_time = effective_time
+            if incomplete_steps:
+                return self._build_multi_step_clarification_response(incomplete_steps)
+
         created_events = []
         context_date = None
         context_time = None
+        existing_events = get_events(days=45)
 
         for step in steps:
             parsed_events = self._parse_single_calendar_instruction(
@@ -1362,6 +1689,9 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
                 if recurrence:
                     event_kwargs["recurrence"] = recurrence
 
+                event["conflicts"] = self._find_conflicting_events(
+                    existing_events, event["start_dt"], event["end_dt"], local_tz
+                )
                 event_id = create_event(**event_kwargs)
                 created_events.append((event, event_id))
                 context_date = event["date"]
@@ -1376,13 +1706,18 @@ Use the date and time from the user's request. Today is {now.strftime("%Y-%m-%d"
             if event.get("recurrence"):
                 recurrence_note = " Weekly recurring."
             location_note = f" at {event.get('location')}" if event.get("location") else ""
+            conflicts = event.get("conflicts") or []
+            conflict_note = ""
+            if conflicts:
+                conflict_summaries = ", ".join(f"'{c.get('summary') or 'an existing event'}'" for c in conflicts)
+                conflict_note = f" ⚠️ Heads up, this overlaps with {conflict_summaries} already on your calendar."
             if "local fallback" in str(event_id).lower():
                 lines.append(
-                    f"⚠️ I prepared a local backup entry for '{event['summary']}' for {event['date']} at {event['start_time']} for {int((event['end_dt'] - event['start_dt']).total_seconds() // 60)} minutes{location_note}.{recurrence_note} Backup ID: {event_id}"
+                    f"⚠️ I prepared a local backup entry for '{event['summary']}' for {event['date']} at {event['start_time']} for {int((event['end_dt'] - event['start_dt']).total_seconds() // 60)} minutes{location_note}.{recurrence_note} Backup ID: {event_id}{conflict_note}"
                 )
             else:
                 lines.append(
-                    f"✅ I scheduled '{event['summary']}' for {event['date']} at {event['start_time']} for {int((event['end_dt'] - event['start_dt']).total_seconds() // 60)} minutes{location_note}.{recurrence_note} Event ID: {event_id}"
+                    f"✅ I scheduled '{event['summary']}' for {event['date']} at {event['start_time']} for {int((event['end_dt'] - event['start_dt']).total_seconds() // 60)} minutes{location_note}.{recurrence_note} Event ID: {event_id}{conflict_note}"
                 )
         return "\n".join(lines)
 

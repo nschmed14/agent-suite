@@ -169,6 +169,50 @@ class CalendarToolTests(unittest.TestCase):
         self.assertEqual(body["end"]["timeZone"], "UTC")
         self.assertEqual(body["end"]["dateTime"], "2026-07-31T16:30:00+00:00")
 
+    def test_delete_event_calls_google_calendar_delete(self) -> None:
+        class FakeEvents:
+            def __init__(self) -> None:
+                self.delete_calls = []
+
+            def delete(self, calendarId: str, eventId: str) -> "FakeDelete":
+                self.delete_calls.append((calendarId, eventId))
+                return FakeDelete()
+
+        class FakeDelete:
+            def execute(self) -> dict:
+                return {}
+
+        fake_service = Mock()
+        fake_service.events.return_value = FakeEvents()
+
+        with patch.object(calendar_tool, "authenticate_google_calendar", return_value=fake_service):
+            result = calendar_tool.delete_event("evt-123")
+
+        self.assertEqual(result, "evt-123")
+        self.assertEqual(fake_service.events.return_value.delete_calls, [("primary", "evt-123")])
+
+    def test_delete_event_removes_matching_local_fallback_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fallback_path = Path(tmpdir) / "calendar_events.json"
+            fallback_path.write_text(
+                json.dumps(
+                    [
+                        {"id": "local-1", "summary": "Keep me"},
+                        {"id": "local-2", "summary": "Delete me"},
+                    ]
+                )
+            )
+
+            with (
+                patch.object(calendar_tool, "FALLBACK_EVENTS_PATH", fallback_path),
+                patch.object(calendar_tool, "authenticate_google_calendar", side_effect=FileNotFoundError("missing creds")),
+            ):
+                result = calendar_tool.delete_event("local-2")
+
+            self.assertIn("local-2", result)
+            remaining = json.loads(fallback_path.read_text())
+            self.assertEqual([item["id"] for item in remaining], ["local-1"])
+
     def test_load_client_config_reads_google_credentials_from_dotenv(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             credentials_path = Path(tmpdir) / "calendar_credentials.json"

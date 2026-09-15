@@ -15,6 +15,15 @@ from backend.server import app
 
 
 class AssistantTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # _create_calendar_event checks for double-bookings by calling get_events against the
+        # real Google Calendar/local fallback file. Default it to an empty calendar in every test
+        # so tests never depend on live credentials or network access; tests that care about
+        # specific existing events can still override this with their own nested patch.
+        get_events_patcher = patch("backend.assistant.get_events", return_value=[])
+        self.addCleanup(get_events_patcher.stop)
+        get_events_patcher.start()
+
     def _build_assistant(self) -> Assistant:
         workspace_root = Path(__file__).resolve().parents[1]
         tempdir = workspace_root / ".tmp" / "assistant-tests"
@@ -411,6 +420,44 @@ class AssistantTests(unittest.TestCase):
 
         self.assertEqual(context["event_id"], "real-event-123")
 
+    def test_reschedule_falls_back_to_real_calendar_lookup_on_fresh_session(self) -> None:
+        assistant = self._build_assistant()
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        fake_events = [
+            {"id": "evt-hannah", "summary": "Meeting with Hannah", "start": f"{tomorrow}T14:00:00", "end": f"{tomorrow}T14:30:00"},
+        ]
+
+        with patch("backend.assistant.get_events", return_value=fake_events), patch("backend.assistant.update_event", return_value="evt-hannah") as update_event_mock:
+            result = asyncio.run(assistant._create_calendar_event("reschedule my meeting with Hannah to 3pm tomorrow"))
+
+        self.assertIn("rescheduled", result.lower())
+        self.assertIn("Hannah", result)
+        update_event_mock.assert_called_once()
+        self.assertEqual(update_event_mock.call_args.kwargs["event_id"], "evt-hannah")
+
+    def test_reschedule_reports_when_no_matching_event_found(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch("backend.assistant.get_events", return_value=[]), patch("backend.assistant.update_event") as update_event_mock:
+            result = asyncio.run(assistant._create_calendar_event("reschedule my meeting with Bob to 3pm tomorrow"))
+
+        self.assertIn("don't have a calendar event", result.lower())
+        update_event_mock.assert_not_called()
+
+    def test_reschedule_asks_which_one_when_multiple_real_events_match(self) -> None:
+        assistant = self._build_assistant()
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        fake_events = [
+            {"id": "evt-1", "summary": "Meeting with Hannah", "start": f"{tomorrow}T14:00:00", "end": f"{tomorrow}T14:30:00"},
+            {"id": "evt-2", "summary": "Meeting with Hannah and team", "start": f"{tomorrow}T16:00:00", "end": f"{tomorrow}T16:30:00"},
+        ]
+
+        with patch("backend.assistant.get_events", return_value=fake_events), patch("backend.assistant.update_event") as update_event_mock:
+            result = asyncio.run(assistant._create_calendar_event("reschedule my meeting with Hannah to 3pm tomorrow"))
+
+        self.assertIn("more than one", result.lower())
+        update_event_mock.assert_not_called()
+
     def test_suggest_available_time_avoids_busy_slots(self) -> None:
         assistant = self._build_assistant()
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -430,6 +477,31 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(route["agent"], "scheduler")
         self.assertIn("john", route["task"].lower())
 
+    def test_extract_requested_day_disambiguates_next_weekday_from_this_weekday(self) -> None:
+        assistant = self._build_assistant()
+        monday = datetime(2026, 9, 14)
+        self.assertEqual(monday.strftime("%A"), "Monday")
+
+        this_friday = assistant._extract_requested_day("schedule a meeting this friday", monday)
+        next_friday = assistant._extract_requested_day("schedule a meeting next friday", monday)
+        bare_friday = assistant._extract_requested_day("schedule a meeting friday", monday)
+
+        self.assertEqual(this_friday, "2026-09-18")
+        self.assertEqual(next_friday, "2026-09-25")
+        self.assertEqual(bare_friday, "2026-09-18")
+
+    def test_create_calendar_event_asks_for_am_pm_instead_of_assuming(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch("backend.assistant._load_ollama_client", return_value=None), patch("backend.assistant.create_event") as create_event_mock:
+            result = asyncio.run(
+                assistant._create_calendar_event("schedule a meeting with Hannah tomorrow at 5 for 30 minutes")
+            )
+
+        self.assertIn("AM or PM", result)
+        self.assertIn("5", result)
+        create_event_mock.assert_not_called()
+
     def test_scheduler_treats_schedule_lookup_as_calendar_read(self) -> None:
         assistant = self._build_assistant()
 
@@ -441,6 +513,132 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(result["message"], [{"summary": "Existing event"}])
         get_events_mock.assert_awaited_once_with("what do I have on the schedule for tomorrow?")
         create_event_mock.assert_not_called()
+
+    def test_route_request_sends_cancel_requests_to_scheduler(self) -> None:
+        assistant = self._build_assistant()
+
+        route = asyncio.run(assistant._route_request("cancel my meeting with Hannah tomorrow"))
+
+        self.assertEqual(route["agent"], "scheduler")
+
+    def test_route_request_does_not_send_subscription_cancellation_to_scheduler(self) -> None:
+        assistant = self._build_assistant()
+
+        route = asyncio.run(assistant._route_request("cancel my Netflix subscription"))
+
+        self.assertEqual(route["agent"], "finance")
+
+    def test_cancel_calendar_event_deletes_matching_meeting(self) -> None:
+        assistant = self._build_assistant()
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        fake_events = [
+            {"id": "evt-1", "summary": "Meeting with Hannah", "start": f"{tomorrow}T14:00:00Z", "end": f"{tomorrow}T14:30:00Z"},
+            {"id": "evt-2", "summary": "Unrelated event", "start": f"{tomorrow}T09:00:00Z", "end": f"{tomorrow}T09:30:00Z"},
+        ]
+
+        with patch("backend.assistant.get_events", return_value=fake_events), patch("backend.assistant.delete_event", return_value="evt-1") as delete_event_mock:
+            result = asyncio.run(assistant._cancel_calendar_event("cancel my meeting with Hannah tomorrow"))
+
+        self.assertIn("canceled", result.lower())
+        self.assertIn("Hannah", result)
+        delete_event_mock.assert_called_once_with("evt-1")
+
+    def test_cancel_calendar_event_reports_when_no_match_found(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch("backend.assistant.get_events", return_value=[]), patch("backend.assistant.delete_event") as delete_event_mock:
+            result = asyncio.run(assistant._cancel_calendar_event("cancel my meeting with Bob tomorrow"))
+
+        self.assertIn("couldn't find", result.lower())
+        delete_event_mock.assert_not_called()
+
+    def test_cancel_calendar_event_asks_which_one_when_multiple_match(self) -> None:
+        assistant = self._build_assistant()
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        fake_events = [
+            {"id": "evt-1", "summary": "Meeting with Hannah", "start": f"{tomorrow}T14:00:00Z", "end": f"{tomorrow}T14:30:00Z"},
+            {"id": "evt-2", "summary": "Meeting with Hannah and team", "start": f"{tomorrow}T16:00:00Z", "end": f"{tomorrow}T16:30:00Z"},
+        ]
+
+        with patch("backend.assistant.get_events", return_value=fake_events), patch("backend.assistant.delete_event") as delete_event_mock:
+            result = asyncio.run(assistant._cancel_calendar_event("cancel my meeting with Hannah tomorrow"))
+
+        self.assertIn("more than one", result.lower())
+        delete_event_mock.assert_not_called()
+
+    def test_scheduler_stub_routes_cancel_requests_to_cancel_helper(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch.object(assistant, "_cancel_calendar_event", new=AsyncMock(return_value="canceled")) as cancel_mock:
+            result = asyncio.run(assistant._scheduler_stub("cancel my meeting with Hannah tomorrow"))
+
+        self.assertEqual(result["message"], "canceled")
+        cancel_mock.assert_awaited_once_with("cancel my meeting with Hannah tomorrow")
+
+    def test_scheduler_stub_routes_detail_update_requests_to_update_helper(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch.object(assistant, "_update_calendar_event_details", new=AsyncMock(return_value="updated")) as update_mock:
+            result = asyncio.run(assistant._scheduler_stub("change the location of my meeting with Hannah to the conference room"))
+
+        self.assertEqual(result["message"], "updated")
+        update_mock.assert_awaited_once_with("change the location of my meeting with Hannah to the conference room")
+
+    def test_update_calendar_event_details_changes_location_without_touching_time(self) -> None:
+        assistant = self._build_assistant()
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        fake_events = [
+            {"id": "evt-hannah", "summary": "Meeting with Hannah", "start": f"{tomorrow}T14:00:00", "end": f"{tomorrow}T14:30:00"},
+        ]
+
+        with patch("backend.assistant.get_events", return_value=fake_events), patch("backend.assistant.update_event", return_value="evt-hannah") as update_event_mock:
+            result = asyncio.run(
+                assistant._update_calendar_event_details("change the location of my meeting with Hannah to the conference room")
+            )
+
+        self.assertIn("updated", result.lower())
+        self.assertIn("conference room", result.lower())
+        update_event_mock.assert_called_once_with(
+            event_id="evt-hannah",
+            summary="Meeting with Hannah",
+            start_time=f"{tomorrow}T14:00:00",
+            end_time=f"{tomorrow}T14:30:00",
+            location="conference room",
+        )
+
+    def test_update_calendar_event_details_adds_attendee(self) -> None:
+        assistant = self._build_assistant()
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        fake_events = [
+            {"id": "evt-hannah", "summary": "Meeting with Hannah", "start": f"{tomorrow}T14:00:00", "end": f"{tomorrow}T14:30:00"},
+        ]
+
+        with patch("backend.assistant.get_events", return_value=fake_events), patch("backend.assistant.update_event", return_value="evt-hannah") as update_event_mock:
+            result = asyncio.run(assistant._update_calendar_event_details("add jane@example.com to the meeting with Hannah"))
+
+        self.assertIn("jane@example.com", result)
+        update_event_mock.assert_called_once_with(
+            event_id="evt-hannah",
+            summary="Meeting with Hannah",
+            start_time=f"{tomorrow}T14:00:00",
+            end_time=f"{tomorrow}T14:30:00",
+            attendees=["jane@example.com"],
+        )
+
+    def test_update_calendar_event_details_reports_when_no_match_found(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch("backend.assistant.get_events", return_value=[]), patch("backend.assistant.update_event") as update_event_mock:
+            result = asyncio.run(assistant._update_calendar_event_details("change the location of my meeting with Bob to the conference room"))
+
+        self.assertIn("couldn't find", result.lower())
+        update_event_mock.assert_not_called()
+
+    def test_looks_like_detail_update_request_does_not_match_time_reschedule(self) -> None:
+        assistant = self._build_assistant()
+
+        self.assertFalse(assistant._looks_like_detail_update_request("reschedule my meeting with Hannah to 3pm tomorrow"))
+        self.assertTrue(assistant._looks_like_detail_update_request("change the location of my meeting with Hannah to the conference room"))
 
     def test_clean_response_text_formats_lists_of_events(self) -> None:
         assistant = self._build_assistant()
@@ -565,6 +763,35 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(end_dt.hour, 12)
         self.assertIsNotNone(start_dt.tzinfo)
 
+    def test_create_calendar_event_accepts_unambiguous_24_hour_time(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch("backend.assistant._load_ollama_client", return_value=None), patch("backend.assistant.create_event", return_value="evt-24h") as create_event_mock:
+            result = asyncio.run(
+                assistant._create_calendar_event("schedule a meeting with Hannah tomorrow at 17:00 for 30 minutes")
+            )
+
+        self.assertIn("evt-24h", result)
+        create_event_mock.assert_called_once()
+        called_kwargs = create_event_mock.call_args.kwargs
+        start_dt = datetime.fromisoformat(called_kwargs["start_time"])
+        self.assertEqual(start_dt.hour, 17)
+
+    def test_create_calendar_event_names_collective_participant_instead_of_stopword(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch("backend.assistant._load_ollama_client", return_value=None), patch("backend.assistant.create_event", return_value="evt-team") as create_event_mock:
+            result = asyncio.run(
+                assistant._create_calendar_event("schedule a meeting with the whole team tomorrow at 2pm for an hour")
+            )
+
+        self.assertIn("Meeting with The Whole Team", result)
+        create_event_mock.assert_called_once_with(
+            summary="Meeting with The Whole Team",
+            start_time=unittest.mock.ANY,
+            end_time=unittest.mock.ANY,
+        )
+
     def test_create_calendar_event_parses_multiple_back_to_back_meetings(self) -> None:
         assistant = self._build_assistant()
 
@@ -657,6 +884,81 @@ class AssistantTests(unittest.TestCase):
         self.assertIn("Empire State Building", result)
         self.assertIn("local backup entry", result.lower())
         create_event_mock.assert_called_once()
+
+    def test_create_calendar_event_warns_about_double_booking(self) -> None:
+        assistant = self._build_assistant()
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        fake_events = [
+            {"id": "evt-existing", "summary": "Dentist appointment", "start": f"{tomorrow}T14:15:00", "end": f"{tomorrow}T15:00:00"},
+        ]
+
+        with patch("backend.assistant._load_ollama_client", return_value=None), \
+             patch("backend.assistant.get_events", return_value=fake_events), \
+             patch("backend.assistant.create_event", return_value="evt-new"):
+            result = asyncio.run(
+                assistant._create_calendar_event("schedule a meeting with Hannah tomorrow at 2pm for 30 minutes")
+            )
+
+        self.assertIn("evt-new", result)
+        self.assertIn("overlaps", result.lower())
+        self.assertIn("Dentist appointment", result)
+
+    def test_create_calendar_event_does_not_warn_when_no_overlap(self) -> None:
+        assistant = self._build_assistant()
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        fake_events = [
+            {"id": "evt-existing", "summary": "Dentist appointment", "start": f"{tomorrow}T09:00:00", "end": f"{tomorrow}T09:30:00"},
+        ]
+
+        with patch("backend.assistant._load_ollama_client", return_value=None), \
+             patch("backend.assistant.get_events", return_value=fake_events), \
+             patch("backend.assistant.create_event", return_value="evt-new"):
+            result = asyncio.run(
+                assistant._create_calendar_event("schedule a meeting with Hannah tomorrow at 2pm for 30 minutes")
+            )
+
+        self.assertIn("evt-new", result)
+        self.assertNotIn("overlaps", result.lower())
+
+    def test_create_calendar_event_splits_compound_request_without_comma_or_trigger_word(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch("backend.assistant._load_ollama_client", return_value=None), patch("backend.assistant.create_event") as create_event_mock:
+            result = asyncio.run(
+                assistant._create_calendar_event("schedule a meeting with Hannah tomorrow and a meeting with will on friday")
+            )
+
+        self.assertIn("Hannah", result)
+        self.assertIn("Will", result)
+        create_event_mock.assert_not_called()
+
+    def test_create_calendar_event_splits_compound_request_joined_by_comma_alone(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch("backend.assistant._load_ollama_client", return_value=None), patch("backend.assistant.create_event") as create_event_mock:
+            result = asyncio.run(
+                assistant._create_calendar_event("schedule a meeting with Hannah tomorrow, a meeting with will on friday")
+            )
+
+        self.assertIn("Hannah", result)
+        self.assertIn("Will", result)
+        create_event_mock.assert_not_called()
+
+    def test_create_calendar_event_creates_both_meetings_in_fully_specified_and_joined_request(self) -> None:
+        assistant = self._build_assistant()
+
+        with patch("backend.assistant._load_ollama_client", return_value=None), patch(
+            "backend.assistant.create_event", side_effect=["evt-hannah", "evt-will"]
+        ) as create_event_mock:
+            result = asyncio.run(
+                assistant._create_calendar_event(
+                    "schedule a meeting with Hannah at 2pm tomorrow for 30 minutes and a meeting with will at 10am on friday for an hour"
+                )
+            )
+
+        self.assertIn("Hannah", result)
+        self.assertIn("Will", result)
+        self.assertEqual(create_event_mock.call_count, 2)
 
     def test_create_calendar_event_handles_sequential_pair_meetings(self) -> None:
         assistant = self._build_assistant()
