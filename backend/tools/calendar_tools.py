@@ -18,7 +18,15 @@ def get_upcoming_events(days: int) -> List[Dict[str, Any]]:
     return get_today_events()
 
 
-def create_event(summary: str, start_time: str, end_time: str, description: str | None = None) -> Dict[str, Any]:
+def create_event(
+    summary: str,
+    start_time: str,
+    end_time: str,
+    description: str | None = None,
+    location: str | None = None,
+    attendees: list[str] | None = None,
+    recurrence: list[str] | None = None,
+) -> Dict[str, Any]:
     return {"ok": False, "message": "Calendar write support requires local OAuth setup."}
 
 

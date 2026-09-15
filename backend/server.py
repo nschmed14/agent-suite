@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from contextlib import asynccontextmanager
 from ipaddress import ip_address, ip_network
@@ -33,20 +34,40 @@ from backend.memory import LocalMemory
 from backend.office_state import OfficeState
 
 settings = get_settings()
+_ASSISTANT_SINGLETON: Assistant | None = None
+
+
+def _get_app_version() -> str:
+    """Return a short, user-visible version string for the running backend."""
+    try:
+        commit = subprocess.check_output(["git", "-C", str(ROOT_DIR), "rev-parse", "--short", "HEAD"], stderr=subprocess.STDOUT).decode().strip()
+        status = subprocess.check_output(["git", "-C", str(ROOT_DIR), "status", "--porcelain"], stderr=subprocess.STDOUT).decode().strip()
+        if status:
+            return f"{commit}-dirty"
+        return commit
+    except Exception:
+        return os.getenv("AGENT_SUITE_VERSION", "dev")
+
+
+APP_VERSION = _get_app_version()
 
 
 def initialize_app_state() -> None:
     """Ensure the backend services exist even when the app is exercised outside a full startup."""
-    if hasattr(app.state, "assistant"):
+    global _ASSISTANT_SINGLETON
+
+    if hasattr(app.state, "assistant") and app.state.assistant is not None:
         return
 
     os.makedirs(settings.data_dir, exist_ok=True)
     app.state.office_state = OfficeState()
     app.state.memory = LocalMemory(settings.sqlite_path, settings.chroma_path)
     app.state.crew_runner = CrewRunner(app.state.office_state, app.state.memory, settings)
-    app.state.assistant = Assistant(app.state.memory, settings)
+    if _ASSISTANT_SINGLETON is None:
+        _ASSISTANT_SINGLETON = Assistant(app.state.memory, settings)
+        _ASSISTANT_SINGLETON.register_callback(lambda payload: manager.broadcast(payload))
+    app.state.assistant = _ASSISTANT_SINGLETON
     app.state.connections: List[WebSocket] = []
-    app.state.assistant.register_callback(lambda payload: manager.broadcast(payload))
 
 
 @asynccontextmanager
@@ -145,6 +166,7 @@ async def health() -> Dict[str, Any]:
         "telemetry_disabled": settings.disable_telemetry,
         "lockdown_mode": settings.lockdown_mode,
         "ollama_base_url": settings.ollama_base_url,
+        "version": APP_VERSION,
     }
 
 

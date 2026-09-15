@@ -9,9 +9,21 @@ function getBackendHost() {
 }
 
 function getBackendBaseUrl() {
-  const override = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
-  const port = override ? String(override) : '8000';
-  return `${window.location.protocol}//${getBackendHost()}:${port}`;
+  const overridePort = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
+  const explicitPort = overridePort ? String(overridePort) : '';
+  const protocol = window.location.protocol || 'http:';
+  const hostname = getBackendHost();
+  const currentPort = window.location.port ? `:${window.location.port}` : '';
+
+  if (explicitPort) {
+    return `${protocol}//${hostname}:${explicitPort}`;
+  }
+
+  if (window.location.hostname) {
+    return `${protocol}//${hostname}${currentPort}`;
+  }
+
+  return `${protocol}//127.0.0.1:8001`;
 }
 
 class UIOverlay {
@@ -51,6 +63,21 @@ class UIOverlay {
     this.launcher.style.zIndex = '40';
     this.launcher.onclick = () => this.openPanel();
     this.container.appendChild(this.launcher);
+
+    this.versionEl = document.createElement('div');
+    this.versionEl.textContent = 'Version: loading…';
+    this.versionEl.style.position = 'absolute';
+    this.versionEl.style.right = '16px';
+    this.versionEl.style.bottom = '16px';
+    this.versionEl.style.zIndex = '45';
+    this.versionEl.style.padding = '6px 10px';
+    this.versionEl.style.borderRadius = '999px';
+    this.versionEl.style.background = 'rgba(17, 24, 39, 0.75)';
+    this.versionEl.style.color = '#f9fafb';
+    this.versionEl.style.fontSize = '12px';
+    this.versionEl.style.fontWeight = '600';
+    this.versionEl.style.pointerEvents = 'none';
+    this.container.appendChild(this.versionEl);
 
     this.panel = document.createElement('div');
     this.panel.style.position = 'absolute';
@@ -194,6 +221,21 @@ class UIOverlay {
 
     this.renderMessages();
     this.setStatus('Waiting for the next request…');
+    this.refreshVersionDisplay();
+  }
+
+  async refreshVersionDisplay() {
+    try {
+      const response = await fetch(`${getBackendBaseUrl()}/health`);
+      const data = await response.json();
+      if (data && data.version) {
+        this.versionEl.textContent = `Version: ${data.version}`;
+      } else {
+        this.versionEl.textContent = 'Version: unknown';
+      }
+    } catch (error) {
+      this.versionEl.textContent = 'Version: offline';
+    }
   }
 
   setStatus(message) {
@@ -303,6 +345,7 @@ class UIOverlay {
     this.setStatus('Thinking locally…');
 
     const backendUrl = `${getBackendBaseUrl()}/assistant`;
+    console.info('Assistant request', { backendUrl, requestText });
     fetch(backendUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

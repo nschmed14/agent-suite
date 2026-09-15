@@ -9,10 +9,21 @@ function getBackendHost() {
 }
 
 function getBackendWsUrl() {
-  const override = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
-  const port = override ? String(override) : '8000';
+  const overridePort = window.AGENT_SUITE_BACKEND_PORT || window.__AGENT_SUITE_BACKEND_PORT__;
+  const explicitPort = overridePort ? String(overridePort) : '';
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${protocol}://${getBackendHost()}:${port}/office`;
+  const hostname = getBackendHost();
+  const currentPort = window.location.port ? `:${window.location.port}` : '';
+
+  if (explicitPort) {
+    return `${protocol}://${hostname}:${explicitPort}/office`;
+  }
+
+  if (window.location.hostname) {
+    return `${protocol}://${hostname}${currentPort}/office`;
+  }
+
+  return `${protocol}://127.0.0.1:8001/office`;
 }
 
 class OfficeViewer {
